@@ -25,6 +25,9 @@
     using System.Reflection.Emit;
     using System.Net;
     using System.Globalization;
+    using OpenFileDialog = System.Windows.Forms.OpenFileDialog;
+    using SaveFileDialog = System.Windows.Forms.SaveFileDialog;
+    using FolderBrowserDialog = System.Windows.Forms.FolderBrowserDialog;
 
     public partial class Form1 : Form
     {
@@ -42,25 +45,28 @@
         private DateTime _lastFiredDate = DateTime.MinValue;
         private System.Windows.Forms.Timer _timerSnooze = new System.Windows.Forms.Timer { Interval = 500 };
         private DateTime _snoozeEndTime;
-        private System.Windows.Forms.Label _lblScheduleStatus;
-        private System.Windows.Forms.Label _lblSnoozeStatus;
-        private System.Windows.Forms.Button _btnActSettings1;
-        private System.Windows.Forms.Button _btnActSettings2;
-        private System.Windows.Forms.Button _btnActSettings3;
+        private System.Windows.Forms.Label? _lblScheduleStatus;
+        private System.Windows.Forms.Label? _lblSnoozeStatus;
+        private System.Windows.Forms.Button? _btnActSettings1;
+        private System.Windows.Forms.Button? _btnActSettings2;
+        private System.Windows.Forms.Button? _btnActSettings3;
         private System.Windows.Forms.ToolTip _actionTip = new System.Windows.Forms.ToolTip();
         private System.Windows.Forms.Timer _timerStatusUI = new System.Windows.Forms.Timer { Interval = 1000 };
-        private ToolStripMenuItem _menuScheduleToggle;
+        private ToolStripMenuItem? _menuScheduleToggle;
         private List<TaskEntry> _taskList = new();
         private int _taskListFilter = 0;
         private TaskEntry? _currentlyFiringTask = null;
+        private readonly System.Windows.Forms.Timer _configSaveTimer =
+            new System.Windows.Forms.Timer { Interval = 600 };
 
-        private static readonly string[] _scheduleLabels = {
-            "Codziennie", "Co dwa dni", "Co trzy dni", "Co cztery dni", "Co pięć dni",
-            "Co sześć dni", "Co tydzień", "W każdy weekend (Pt.-Nd.)",
-            "W każdy poniedziałek", "W każdy wtorek", "W każdą środę", "W każdy czwartek",
-            "W każdy piątek", "W każdą sobotę", "W każdą niedzielę", "Od poniedziałku do piątku",
-            "Powtarzaj co..."
-        };
+        private bool _initializing = true;
+
+        private bool _forceExit;
+
+        private readonly List<IDisposable> _disposables = new();
+
+        private readonly List<Form> _activeToasts = new();
+
         private const int SCHEDULE_INTERVAL_IDX = 16;
 
         [DllImport("shell32.dll", CharSet = CharSet.Auto)]
@@ -68,7 +74,6 @@
 
         [DllImport("user32.dll")]
         private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-
 
         [System.Runtime.InteropServices.ComImport]
         [System.Runtime.InteropServices.Guid("00021401-0000-0000-C000-000000000046")]
@@ -121,47 +126,121 @@
             ((IPersistFile)link).Save(shortcutPath, false);
         }
 
-        public static Icon ExtractIconFromExe(string file, int number, bool largeIcon)
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool DestroyIcon(IntPtr hIcon);
+
+        public static Icon? ExtractIconFromExe(string file, int number, bool largeIcon)
         {
             IntPtr[] large = new IntPtr[1];
             IntPtr[] small = new IntPtr[1];
-            ExtractIconEx(file, number, large, small, 1);
-            return Icon.FromHandle(largeIcon ? large[0] : small[0]);
+            try
+            {
+                if (ExtractIconEx(file, number, large, small, 1) == 0) return null;
+                IntPtr handle = largeIcon ? large[0] : small[0];
+                if (handle == IntPtr.Zero) return null;
+                using var tmp = Icon.FromHandle(handle);
+                return (Icon)tmp.Clone();
+            }
+            catch { return null; }
+            finally
+            {
+                if (large[0] != IntPtr.Zero) DestroyIcon(large[0]);
+                if (small[0] != IntPtr.Zero) DestroyIcon(small[0]);
+            }
+        }
+
+        private static bool TryParseTime(string? text, out TimeSpan value)
+        {
+            value = default;
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            text = text.Trim();
+            return TimeSpan.TryParse(text, CultureInfo.InvariantCulture, out value)
+                || TimeSpan.TryParse(text + ":00", CultureInfo.InvariantCulture, out value);
+        }
+
+        private static string FormatRemaining(TimeSpan ts)
+        {
+            if (ts.TotalSeconds <= 0) return "00:00:00";
+            return ts.TotalDays >= 1
+                ? $"{(int)ts.TotalDays}d {ts.Hours:D2}:{ts.Minutes:D2}:{ts.Seconds:D2}"
+                : $"{(int)ts.TotalHours:D2}:{ts.Minutes:D2}:{ts.Seconds:D2}";
+        }
+
+        private static long GetIdleMilliseconds()
+        {
+            var info = new LASTINPUTINFO { cbSize = LASTINPUTINFO.SizeOf };
+            if (!GetLastInputInfo(ref info)) return 0;
+
+            return unchecked((uint)Environment.TickCount - info.dwTime);
+        }
+
+        private static Image? LoadImageSafe(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return null;
+                using var src = Image.FromFile(path);
+                return new Bitmap(src);
+            }
+            catch { return null; }
+        }
+
+        private bool TryStartProcess(ProcessStartInfo psi, bool waitForExit = false)
+        {
+            try
+            {
+                using var p = Process.Start(psi);
+                if (waitForExit) p?.WaitForExit();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                ShowActionError(psi.FileName, ex);
+                return false;
+            }
+        }
+
+        private bool TryStartProcess(string fileName, string arguments = "")
+            => TryStartProcess(new ProcessStartInfo
+            {
+                FileName        = fileName,
+                Arguments       = arguments,
+                UseShellExecute = false,
+                CreateNoWindow  = true
+            });
+
+        private void ShowActionError(string what, Exception ex)
+        {
+            void Show() => MessageBox.Show(
+                Lang.T("msg.processError", what, ex.Message),
+                Lang.T("msg.title"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            try
+            {
+                if (InvokeRequired) BeginInvoke(new Action(Show));
+                else Show();
+            }
+            catch { }
         }
 
         public static string systemDirectory = Environment.GetFolderPath(Environment.SpecialFolder.System);
         public static string shell32Path = Path.Combine(systemDirectory, "shell32.dll");
-        public static string appDirectory = Path.GetDirectoryName(Application.ExecutablePath);
+        public static string appDirectory =
+            Path.GetDirectoryName(Application.ExecutablePath) ?? AppDomain.CurrentDomain.BaseDirectory;
 
         public Form1()
         {
             InitializeComponent();
-            string[] comboActions = new string[] {
-                "Odtwórz dźwięk",
-                "Uruchom polecenie",
-                "Wyłącz monitor",
-                "Uśpienie",
-                "Wylogowanie",
-                "Restart",
-                "Wyłączenie komputera",
-                "Hibernacja",
-                "Blokada użytkownika",
-                "Oczyść pliki tymczasowe",
-                "Zapisz notatkę na pulpicie",
-                "Otwórz stronę WWW",
-                "Opróżnij kosz",
-                "Wykonaj zrzut ekranu",
-            };
-            comboBox1.Items.AddRange(comboActions);
-            comboBox2.Items.AddRange(comboActions);
-            comboBox3.Items.AddRange(comboActions);
+
+            comboBox1.Items.AddRange(ActionIds);
+            comboBox2.Items.AddRange(ActionIds);
+            comboBox3.Items.AddRange(ActionIds);
             timer1.Interval = 100;
             timer1.Tick += Timer1_Tick;
             timer2.Interval = 100;
             timer2.Tick += Timer2_Tick;
             timer3.Interval = 1000;
             timer3.Tick += Timer3_Tick;
-
+            _configSaveTimer.Tick += (s, ev) => { _configSaveTimer.Stop(); SaveConfigFile(); };
 
             checkBox8.CheckedChanged += checkBox8_CheckedChanged;
             checkBox9.CheckedChanged += checkBox9_CheckedChanged;
@@ -175,34 +254,25 @@
             notifyIcon1.Icon = SystemIcons.Application;
             notifyIcon1.ContextMenuStrip = contextMenuStrip1;
 
-            int icon1 = 112;
-
-            if (File.Exists(Path.Combine(appDirectory, "icons", "clock.ico")))
+            const int clockIconIndex = 112;
+            try
             {
-                notifyIcon1.Icon = new Icon(Path.Combine(appDirectory, "icons", "clock.ico"));
+                string icoPath = Path.Combine(appDirectory, "icons", "clock.ico");
+                notifyIcon1.Icon = File.Exists(icoPath)
+                    ? new Icon(icoPath)
+                    : ExtractIconFromExe(shell32Path, clockIconIndex, true) ?? SystemIcons.Application;
             }
-            else
+            catch
             {
-                notifyIcon1.Icon = ExtractIconFromExe(shell32Path, icon1, true);
-            }
-
-            Version osVersion = Environment.OSVersion.Version;
-            if (osVersion.Major < 10)
-            {
-                tabPage1.Text = "Aktywator bezczynności";
-                tabPage2.Text = "Aktywator czasowy";
-                tabPage3.Text = "Ustawienia";
-                tabPage4.Text = "Autorzy";
+                notifyIcon1.Icon = SystemIcons.Application;
             }
 
             textBoxInfo.ScrollBars = ScrollBars.Vertical;
 
-            string dataLocation = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "./data/psd.dat");
-            bool isFirstLaunch = !File.Exists(dataLocation);
+            bool isFirstLaunch = !PasswordStore.Exists();
             if (isFirstLaunch)
             {
-
-                Form4 form4Welcome = new Form4();
+                using var form4Welcome = new Form4();
                 form4Welcome.ShowDialog();
 
                 checkBox1.Checked = true;
@@ -210,157 +280,54 @@
                 SaveConfigFile();
             }
 
-
-        }
-
-        public void ShowLabelBasedOnVersion()
-        {
-            Task.Run(async () =>
-            {
-                try
-                {
-                    string repoUrl = "https://api.github.com/repos/Mattronix7200/TimerSysApp/tags";
-                    string versionFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "./data/version.txt");
-                    using var client = new HttpClient();
-                    client.Timeout = TimeSpan.FromSeconds(10);
-                    client.DefaultRequestHeaders.Add("User-Agent", "C# App");
-                    var response = await client.GetAsync(repoUrl).ConfigureAwait(false);
-                    var responseContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                    var tags = JsonConvert.DeserializeObject<List<GitHubTag>>(responseContent);
-
-
-                    if (tags == null || !tags.Any())
-                    {
-                        BeginInvoke(new Action(() => { label23.Enabled = true; label23.Visible = true; }));
-                        return;
-                    }
-
-                    var versionTags = tags.Where(t => Regex.IsMatch(t.Name, @"release-\d+\.\d+\.\d+")).ToList();
-                    var latestVersion = versionTags.Select(t => new Version(t.Name.Replace("release-", ""))).OrderByDescending(v => v).FirstOrDefault();
-
-
-                    string currentVersionStr = "0.0.0";
-                    if (File.Exists(versionFilePath))
-                        currentVersionStr = File.ReadAllText(versionFilePath).Trim();
-                    var currentVersion = Version.TryParse(currentVersionStr, out var cv) ? cv : new Version("0.0.0");
-
-                    bool isNewer = latestVersion != null && latestVersion > currentVersion;
-
-                    BeginInvoke(new Action(() =>
-                    {
-                        label20.Enabled = isNewer;
-                        label20.Visible = isNewer;
-                        label23.Enabled = !isNewer;
-                        label23.Visible = !isNewer;
-                    }));
-                }
-                catch
-                {
-
-                    try { BeginInvoke(new Action(() => { label23.Visible = true; label23.Enabled = true; })); }
-                    catch { }
-                }
-            });
         }
 
         public class GitHubTag
         {
             [JsonProperty("name")]
-            public string Name { get; set; }
+            public string Name { get; set; } = "";
         }
 
+        public void UnlockScreen() => SetUiLocked(false);
 
-        public void UnlockScreen()
+        private void SetUiLocked(bool locked)
         {
-            tabControl1.TabPages["tabPage1"].Enabled = true;
-            tabControl1.TabPages["tabPage2"].Enabled = true;
-            tabControl1.TabPages["tabPage3"].Enabled = true;
-            button6.Enabled = false;
-            label19.Visible = false;
-            label19.Enabled = false;
+            foreach (string name in new[] { "tabActivator", "tabPage5", "tabPage3" })
+            {
+                var page = tabControl1.TabPages[name];
+                if (page != null) page.Enabled = !locked;
+            }
+            button6.Enabled   = locked;
+            label19.Visible   = locked;
+            label19.Enabled   = locked;
+            if (locked) label19.BringToFront();
         }
 
-        private void checkBox6_CheckedChanged(object sender, EventArgs e)
+        private void checkBox6_CheckedChanged(object? sender, EventArgs e)
         {
+            if (_initializing) return;
             appSettings["protect"] = checkBox6.Checked ? "1" : "0";
             SaveConfigFile();
-            if (checkBox6.Checked)
-            {
-                tabControl1.TabPages["tabPage1"].Enabled = false;
-                tabControl1.TabPages["tabPage2"].Enabled = false;
-                tabControl1.TabPages["tabPage3"].Enabled = false;
-                button6.Enabled = true;
-                label19.Visible = true;
-                label19.Enabled = true;
-
-            }
-            else
-            {
-                tabControl1.TabPages["tabPage1"].Enabled = true;
-                tabControl1.TabPages["tabPage2"].Enabled = true;
-                tabControl1.TabPages["tabPage3"].Enabled = true;
-                button6.Enabled = false;
-                label19.Visible = false;
-                label19.Enabled = false;
-
-            }
-
+            SetUiLocked(checkBox6.Checked);
         }
 
-        private Form2 form2 = null;
-        private Form3 form3 = null;
+        private Form3? form3 = null;
 
-        private void button6_Click(object sender, EventArgs e)
+        private void button6_Click(object? sender, EventArgs e)
         {
-            if (form2 == null || form2.IsDisposed)
-            {
-                form2 = new Form2();
-                form2.ShowDialog();
-            }
-            else
-            {
-                form2.BringToFront();
-            }
+            using var dlgPwd = new Form2();
+            dlgPwd.ShowDialog(this);
         }
 
-        private void label19_Click(object sender, EventArgs e)
+        private void label19_Click(object? sender, EventArgs e)
         {
-            if (form3 == null || form3.IsDisposed)
+
+            if (form3 != null && !form3.IsDisposed) { form3.Activate(); return; }
+            using (form3 = new Form3 { MainForm = this })
             {
-                form3 = new Form3();
-                form3.MainForm = this;
-                form3.Show();
+                form3.ShowDialog(this);
             }
-            else
-            {
-                form3.BringToFront();
-            }
-        }
-
-
-        private void tabPage1_Click(object sender, EventArgs e)
-        {
-            ShowPasswordForm();
-        }
-
-        private void tabPage2_Click(object sender, EventArgs e)
-        {
-            ShowPasswordForm();
-        }
-
-        private void tabPage3_Click(object sender, EventArgs e)
-        {
-            ShowPasswordForm();
-        }
-
-        private void ShowPasswordForm()
-        {
-            if (checkBox6.Checked)
-            {
-                Form3 form3 = new Form3();
-                form3.MainForm = this;
-                form3.ShowDialog();
-            }
+            form3 = null;
         }
 
         private Dictionary<string, string> GetDefaultSettings() => new Dictionary<string, string>
@@ -379,7 +346,7 @@
             ["runWindowsAuto"] = "0",
             ["autoStart"] = "0",
             ["noMinimalize"] = "0",
-            ["RunHost"] = "0",
+            ["RunHost"] = "1",
             ["powerPlanSetID"] = "",
             ["powerPlanID"] = "",
             ["protect"] = "0",
@@ -421,6 +388,38 @@
             ["ss_interval"] = "1000",
             ["ss_compress"] = "0",
             ["ss_folder"]   = "",
+
+            ["language"]      = "",
+            ["checkUpdates"]  = "1",
+            ["skipVersion"]   = "",
+            ["activatorMode"]   = "1",
+            ["timer2InputMode"] = "duration",
+            ["timer2Duration"]  = "00:30:00",
+            ["hideTips"]        = "0",
+            ["soundEveryTask"]  = "0",
+            ["act1_sound"]    = "",
+            ["act2_sound"]    = "",
+            ["act3_sound"]    = "",
+
+            ["smtp_host"]     = "",
+            ["smtp_port"]     = "587",
+            ["smtp_security"] = "Auto",
+            ["smtp_auth"]     = "Password",
+            ["smtp_oauth_client"]  = "",
+            ["smtp_oauth_secret"]  = "",
+            ["smtp_oauth_refresh"] = "",
+            ["smtp_oauth_url"]     = "",
+            ["smtp_user"]     = "",
+            ["smtp_pass"]     = "",
+            ["smtp_from"]     = "",
+            ["smtp_fromName"] = "",
+
+            ["act1_mail_to"] = "", ["act2_mail_to"] = "", ["act3_mail_to"] = "",
+            ["act1_mail_subject"] = "", ["act2_mail_subject"] = "", ["act3_mail_subject"] = "",
+            ["act1_mail_template"] = "ShortText", ["act2_mail_template"] = "ShortText", ["act3_mail_template"] = "ShortText",
+            ["act1_mail_body"] = "", ["act2_mail_body"] = "", ["act3_mail_body"] = "",
+            ["act1_mail_attachment"] = "", ["act2_mail_attachment"] = "", ["act3_mail_attachment"] = "",
+            ["act1_mail_command"] = "", ["act2_mail_command"] = "", ["act3_mail_command"] = "",
         };
 
         private void LoadConfigFile()
@@ -438,29 +437,27 @@
                 catch {  }
             }
 
-
-            if (!loaded.Any())
-            {
-                string oldIni = Path.Combine(dataDir, "config.ini");
-                if (File.Exists(oldIni)) {  }
-            }
-
             appSettings = new NameValueCollection();
+
+            Lang.SetQuiet(string.IsNullOrEmpty(loaded.TryGetValue("language", out var lc) ? lc : "")
+                ? Lang.SystemDefault : lc);
             foreach (var kv in defaults)
                 appSettings[kv.Key] = loaded.TryGetValue(kv.Key, out var v) ? v : kv.Value;
             foreach (var kv in loaded)
                 if (appSettings[kv.Key] == null) appSettings[kv.Key] = kv.Value;
 
-
             if (!File.Exists(configFilePath)) SaveConfigFile();
-
 
             if (appSettings["autoStart"] == "1")
             {
-                timer1EndTime = DateTime.Now.Add(TimeSpan.Parse(appSettings["timer1ActivateBy"]));
+                if (!TryParseTime(appSettings["timer1ActivateBy"], out var autoStartSpan))
+                {
+                    autoStartSpan = TimeSpan.FromMinutes(5);
+                    appSettings["timer1ActivateBy"] = "00:05:00";
+                }
+                timer1EndTime = DateTime.Now.Add(autoStartSpan);
                 timer1.Start();
             }
-
 
             comboBox1.SelectedIndex = int.TryParse(appSettings["defaultAction1"], out int a1) ? a1 : 0;
             comboBox1.SelectedIndexChanged += comboBox1_SelectedIndexChanged;
@@ -477,14 +474,13 @@
             textBoxUser.Text = appSettings["userSet"];
             textBoxUser.TextChanged += textBoxUser_TextChanged;
 
-
-            if (!string.IsNullOrEmpty(appSettings["timer3CheckedDays"]))
+            string checkedDays = appSettings["timer3CheckedDays"] ?? "";
+            if (!string.IsNullOrEmpty(checkedDays))
             {
-                foreach (var part in appSettings["timer3CheckedDays"].Split(','))
+                foreach (var part in checkedDays.Split(','))
                     if (int.TryParse(part.Trim(), out int idx) && idx >= 0 && idx < checkedListBox1.Items.Count)
                         checkedListBox1.SetItemChecked(idx, true);
             }
-
 
             if (!DateTime.TryParseExact(appSettings["timer2DateActivateBy"], "dd.MM.yyyy", CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out DateTime settingsDate))
                 settingsDate = DateTime.Now;
@@ -492,7 +488,6 @@
             dateTimePicker1.MinDate = settingsDate < currentDate ? settingsDate : currentDate;
             dateTimePicker1.Value = settingsDate;
             dateTimePicker1.ValueChanged += dateTimePicker1_ValueChanged;
-
 
             checkBox1.Checked = appSettings["runWindowsAuto"] == "1";
             checkBox2.Checked = appSettings["autoStart"] == "1";
@@ -507,14 +502,11 @@
             checkBox11.Checked = appSettings["darkModeEnabled"] == "1";
             checkBox12.Checked = appSettings["autoStartQueue"] != "0";
 
-
             try { _taskList = JsonConvert.DeserializeObject<List<TaskEntry>>(appSettings["taskList"] ?? "[]") ?? new(); }
             catch { _taskList = new(); }
 
-
             if (appSettings["timer3Enabled"] == "1" && !string.IsNullOrEmpty(appSettings["timer3CheckedDays"]))
                 timer3.Start();
-
 
             if (appSettings["autoStartQueue"] != "0")
             {
@@ -524,144 +516,153 @@
                     timer2.Start();
             }
 
+            _initializing = false;
+            ApplyLoadedSettings();
         }
 
+        private void ApplyLoadedSettings()
+        {
+
+            this.MinimizeBox = !checkBox3.Checked;
+            this.FormClosing -= Form1_FormClosing;
+            this.Resize -= Form1_Resize;
+            notifyIcon1.DoubleClick -= NotifyIcon1_DoubleClick;
+            if (checkBox3.Checked)
+            {
+                this.FormClosing += Form1_FormClosing;
+                this.Resize += Form1_Resize;
+                notifyIcon1.DoubleClick += NotifyIcon1_DoubleClick;
+            }
+
+            timer1.Tick -= Timer1_Tick;
+            timer1.Tick -= Timer1_Tick_Reset;
+            if (checkBox4.Checked) timer1.Tick += Timer1_Tick_Reset;
+            else                   timer1.Tick += Timer1_Tick;
+
+            if (checkBox1.Checked) SetAutoStart(true);
+
+            if (checkBox5.Checked && !string.IsNullOrEmpty(appSettings["powerPlanSetID"]))
+            {
+                importedPowerPlanGuid = appSettings["powerPlanSetID"] ?? "";
+                StartPowerPlanMonitor();
+            }
+        }
 
         private void SaveConfigFile()
         {
             try
             {
                 var dict = new Dictionary<string, string>();
-                foreach (string k in appSettings.AllKeys)
+                foreach (string? k in appSettings.AllKeys)
+                {
+                    if (k == null) continue;
                     dict[k] = appSettings[k] ?? "";
+                }
 
                 dict["taskList"] = JsonConvert.SerializeObject(_taskList ?? new List<TaskEntry>());
-                Directory.CreateDirectory(Path.GetDirectoryName(configFilePath));
-                File.WriteAllText(configFilePath, JsonConvert.SerializeObject(dict, Formatting.Indented));
+
+                string? dir = Path.GetDirectoryName(configFilePath);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+                string tmp = configFilePath + ".tmp";
+                File.WriteAllText(tmp, JsonConvert.SerializeObject(dict, Formatting.Indented));
+                File.Move(tmp, configFilePath, true);
             }
             catch {  }
         }
 
+        private void ScheduleConfigSave()
+        {
+            _configSaveTimer.Stop();
+            _configSaveTimer.Start();
+        }
 
-        private System.Threading.Timer powerPlanMonitor;
-        private string importedPowerPlanGuid;
+        private System.Threading.Timer? powerPlanMonitor;
+        private string importedPowerPlanGuid = "";
+
+        private volatile bool _powerPlanGuardActive;
+
+        private static readonly Regex _guidRegex = new Regex(
+            @"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            RegexOptions.Compiled);
+
+        private static string RunPowerCfg(string arguments, bool captureOutput)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName               = "powercfg",
+                    Arguments              = arguments,
+                    UseShellExecute        = false,
+                    CreateNoWindow         = true,
+                    WindowStyle            = ProcessWindowStyle.Hidden,
+                    RedirectStandardOutput = captureOutput,
+                    RedirectStandardError  = captureOutput
+                };
+                using var proc = Process.Start(psi);
+                if (proc == null) return "";
+                string output = captureOutput ? proc.StandardOutput.ReadToEnd() : "";
+                proc.WaitForExit(15000);
+                return output;
+            }
+            catch { return ""; }
+        }
+
+        private static string ExtractGuid(string powercfgOutput)
+        {
+            var m = _guidRegex.Match(powercfgOutput ?? "");
+            return m.Success ? m.Value : "";
+        }
 
         private string ImportAndSetActivePowerPlan()
         {
-            var cmd = new Process { StartInfo = { FileName = "powercfg" } };
-            var inputPath = GetDataFilePath("plan.pow");
-            cmd.StartInfo.CreateNoWindow = true;
-            cmd.StartInfo.WindowStyle = ProcessWindowStyle.Hidden;
+            var inputPath  = GetDataFilePath("plan.pow");
             var guidString = Guid.NewGuid().ToString("D");
 
-            cmd.StartInfo.Arguments = $"-import \"{inputPath}\" {guidString}";
-            cmd.Start();
-
-            cmd.StartInfo.Arguments = $"/setactive {guidString}";
-            cmd.Start();
+            RunPowerCfg($"-import \"{inputPath}\" {guidString}", captureOutput: false);
+            RunPowerCfg($"/setactive {guidString}", captureOutput: false);
 
             SavePowerPlanImportedGuidToConfigFile(guidString);
-
             return guidString;
         }
 
         private void StartPowerPlanMonitor()
         {
+            StopPowerPlanMonitor();
+            _powerPlanGuardActive = true;
             powerPlanMonitor = new System.Threading.Timer(CheckPowerPlan, null, TimeSpan.Zero, TimeSpan.FromSeconds(30));
         }
 
         private void StopPowerPlanMonitor()
         {
+            _powerPlanGuardActive = false;
             powerPlanMonitor?.Dispose();
             powerPlanMonitor = null;
         }
 
-        private void CheckPowerPlan(object state)
+        private void CheckPowerPlan(object? state)
         {
-            if (!checkBox5.Checked)
+
+            try
             {
-                return;
+                if (!_powerPlanGuardActive || string.IsNullOrEmpty(importedPowerPlanGuid)) return;
+
+                string active = ExtractGuid(RunPowerCfg("/GETACTIVESCHEME", captureOutput: true));
+                if (string.IsNullOrEmpty(active)) return;
+
+                if (!string.Equals(active, importedPowerPlanGuid, StringComparison.OrdinalIgnoreCase))
+                    RunPowerCfg($"/setactive {importedPowerPlanGuid}", captureOutput: false);
             }
-
-            var cmd = new Process { StartInfo = { FileName = "powercfg" } };
-            cmd.StartInfo.CreateNoWindow = true;
-            cmd.StartInfo.WindowStyle = ProcessWindowStyle.Hidden;
-            cmd.StartInfo.Arguments = "/GETACTIVESCHEME";
-            cmd.StartInfo.RedirectStandardOutput = true;
-            cmd.StartInfo.UseShellExecute = false;
-            cmd.Start();
-
-            var output = cmd.StandardOutput.ReadToEnd();
-            var outputArray = output.Split(' ');
-
-            if (Environment.OSVersion.Version.Major < 10)
-            {
-
-                if (outputArray.Length > 3)
-                {
-                    var activePlanGuid = outputArray[4].Trim();
-                    if (activePlanGuid != importedPowerPlanGuid)
-                    {
-                        cmd.StartInfo.Arguments = $"/setactive {importedPowerPlanGuid}";
-                        cmd.Start();
-                    }
-                }
-            }
-            else
-            {
-
-                if (outputArray.Length > 2)
-                {
-                    var activePlanGuid = outputArray[3].Trim();
-                    if (activePlanGuid != importedPowerPlanGuid)
-                    {
-                        cmd.StartInfo.Arguments = $"/setactive {importedPowerPlanGuid}";
-                        cmd.Start();
-                    }
-                }
-            }
+            catch { }
         }
-
 
         private string GetCurrentPowerPlanGuid()
-        {
-            var cmd = new Process { StartInfo = { FileName = "powercfg" } };
-            cmd.StartInfo.CreateNoWindow = true;
-            cmd.StartInfo.WindowStyle = ProcessWindowStyle.Hidden;
-            cmd.StartInfo.Arguments = "/GETACTIVESCHEME";
-            cmd.StartInfo.RedirectStandardOutput = true;
-            cmd.StartInfo.UseShellExecute = false;
-            cmd.Start();
-
-            var output = cmd.StandardOutput.ReadToEnd();
-            var outputArray = output.Split(' ');
-
-            if (Environment.OSVersion.Version.Major < 10)
-            {
-
-                if (outputArray.Length > 3)
-                {
-                    var activePlanGuid = outputArray[4].Trim();
-                    return activePlanGuid;
-                }
-            }
-            else
-            {
-
-                if (outputArray.Length > 2)
-                {
-                    var activePlanGuid = outputArray[3].Trim();
-                    return activePlanGuid;
-                }
-            }
-
-            return null;
-        }
-
+            => ExtractGuid(RunPowerCfg("/GETACTIVESCHEME", captureOutput: true));
 
         private void SavePowerPlanGuidToConfigFile(string guid)
         {
-            appSettings["powerPlanID"] = guid;
+            appSettings["powerPlanID"] = guid ?? "";
             SaveConfigFile();
         }
 
@@ -690,34 +691,36 @@
                     CreateNoWindow = true,
                     WorkingDirectory = Path.GetDirectoryName(scriptPath)
                 };
-                Process.Start(psi)?.WaitForExit();
+                TryStartProcess(psi, waitForExit: true);
             }
             SavePowerPlanRestoreGuidToConfigFile();
         }
-
 
         [DllImport("user32.dll")]
         static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
 
         [DllImport("winmm.dll", CharSet = CharSet.Unicode)]
-        private static extern int mciSendString(string command, System.Text.StringBuilder returnValue, int returnLength, IntPtr winHandle);
+        private static extern int mciSendString(string command, System.Text.StringBuilder? returnValue, int returnLength, IntPtr winHandle);
 
         private static readonly string[] _soundExtensions = { "*.wav", "*.mp3", "*.aac", "*.ogg", "*.wma", "*.flac" };
+        private System.Media.SoundPlayer? _wavPlayer;
+
+        private string ResolveSoundFor(int activator)
+        {
+            string value = activator > 0 ? (appSettings[$"act{activator}_sound"] ?? "").Trim() : "";
+            if (string.IsNullOrEmpty(value)) value = (appSettings["soundFile"] ?? "").Trim();
+            if (string.IsNullOrEmpty(value)) value = SoundCatalog.DefaultFile;
+            return SoundCatalog.ResolvePath(value);
+        }
 
         private void PlaySoundFile(string filePath)
         {
 
             if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
             {
-                string soundsDir = Path.Combine(appDirectory, "sounds");
-                if (Directory.Exists(soundsDir))
-                {
-                    foreach (var ext in _soundExtensions)
-                    {
-                        var found = Directory.GetFiles(soundsDir, ext).FirstOrDefault();
-                        if (found != null) { filePath = found; break; }
-                    }
-                }
+
+                string builtIn = SoundCatalog.ResolvePath(SoundCatalog.DefaultFile);
+                if (File.Exists(builtIn)) filePath = builtIn;
 
                 if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
                 {
@@ -755,7 +758,13 @@
             string extLow = Path.GetExtension(filePath).ToLowerInvariant();
             if (extLow == ".wav")
             {
-                try { new System.Media.SoundPlayer(filePath).Play(); } catch { }
+                try
+                {
+                    _wavPlayer?.Dispose();
+                    _wavPlayer = new System.Media.SoundPlayer(filePath);
+                    _wavPlayer.Play();
+                }
+                catch { }
             }
             else
             {
@@ -781,57 +790,60 @@
             public uint dwTime;
         }
 
-        private void Timer1_Tick(object sender, EventArgs e)
+        private TimeSpan? IdleThresholdFor(TaskEntry t)
+            => TryParseTime(string.IsNullOrEmpty(t.IdleTimeout) ? textBox4.Text : t.IdleTimeout, out var ts)
+                ? ts
+                : (TimeSpan?)null;
+
+        private void Timer1_Tick(object? sender, EventArgs e)
         {
-            LASTINPUTINFO lastInputInfo = new LASTINPUTINFO();
-            lastInputInfo.cbSize = LASTINPUTINFO.SizeOf;
-            GetLastInputInfo(ref lastInputInfo);
-            long idleMs = (long)(Environment.TickCount64 - lastInputInfo.dwTime);
+            long idleMs = GetIdleMilliseconds();
 
             bool anyFired = false;
             var tasks = _taskList.Where(t => t.ActivatorType == 1 && t.Enabled).ToList();
             foreach (var t in tasks)
             {
-
-                string timeoutStr = string.IsNullOrEmpty(t.IdleTimeout) ? textBox4.Text : t.IdleTimeout;
-                if (!TimeSpan.TryParse(timeoutStr, out var threshold)) continue;
-                if (idleMs >= (long)threshold.TotalMilliseconds)
+                var threshold = IdleThresholdFor(t);
+                if (threshold == null) continue;
+                if (idleMs >= (long)threshold.Value.TotalMilliseconds)
                 {
                     ExecuteCommand(t.Action, 1);
                     t.Enabled = false;
+                    t.Completed = true;
                     anyFired = true;
                 }
             }
             if (anyFired) { SaveConfigFile(); RefreshTaskGrid(); }
 
-
             if (!_taskList.Any(t => t.ActivatorType == 1 && t.Enabled))
             {
                 timer1.Stop();
                 _lastSecond1 = -1;
-                if (anyFired && !checkBox10.Checked) textBox5.Text = "Akcja wykonana.";
+
+                textBox5.Text = anyFired && !checkBox10.Checked ? Lang.T("msg.actionDone") : "";
                 return;
             }
 
-
             if (!checkBox10.Checked)
             {
-                var pending = _taskList
-                    .Where(t => t.ActivatorType == 1 && t.Enabled && TimeSpan.TryParse(
-                        string.IsNullOrEmpty(t.IdleTimeout) ? textBox4.Text : t.IdleTimeout, out _))
-                    .Select(t => TimeSpan.Parse(string.IsNullOrEmpty(t.IdleTimeout) ? textBox4.Text : t.IdleTimeout))
-                    .OrderBy(ts => ts)
+
+                TimeSpan? pending = _taskList
+                    .Where(t => t.ActivatorType == 1 && t.Enabled)
+                    .Select(IdleThresholdFor)
+                    .Where(ts => ts != null)
+                    .OrderBy(ts => ts!.Value)
                     .FirstOrDefault();
-                if (pending != default)
+
+                if (pending != null)
                 {
-                    var remaining = pending - TimeSpan.FromMilliseconds(idleMs);
+                    var remaining = pending.Value - TimeSpan.FromMilliseconds(idleMs);
                     int sec1 = (int)remaining.TotalSeconds;
                     if (sec1 != _lastSecond1)
                     {
                         _lastSecond1 = sec1;
                         textBox5.Text = remaining.TotalSeconds > 0
-                            ? "Pozostały czas: " + remaining.ToString(@"hh\:mm\:ss")
-                            : "Gotowe...";
+                            ? Lang.T("msg.remaining", FormatRemaining(remaining))
+                            : Lang.T("msg.ready");
                     }
                 }
             }
@@ -839,16 +851,15 @@
 
         public void StartTimer1()
         {
-            timer1EndTime = DateTime.Now.Add(TimeSpan.Parse(textBox4.Text));
+            timer1EndTime = DateTime.Now.Add(
+                TryParseTime(textBox4.Text, out var ts) ? ts : TimeSpan.FromMinutes(5));
             timer1.Start();
         }
 
-
-        private void Timer2_Tick(object sender, EventArgs e)
+        private void Timer2_Tick(object? sender, EventArgs e)
         {
             var now = DateTime.UtcNow;
             bool anyFired = false;
-
 
             var stopers = _taskList.Where(t => t.ActivatorType == 2 && t.Enabled && t.EndTimeUtc != default).ToList();
             foreach (var t in stopers)
@@ -857,21 +868,20 @@
                 {
                     ExecuteCommand(t.Action, 2);
                     t.Enabled = false;
+                    t.Completed = true;
                     anyFired = true;
                 }
             }
             if (anyFired) { SaveConfigFile(); RefreshTaskGrid(); }
-
 
             var remaining = _taskList.Where(t => t.ActivatorType == 2 && t.Enabled && t.EndTimeUtc > now).ToList();
             if (!remaining.Any())
             {
                 timer2.Stop();
                 _lastSecond2 = -1;
-                if (!anyFired) textBox9.Text = "00:00:00";
+                textBox9.Text = anyFired && !checkBox10.Checked ? Lang.T("msg.actionDone") : "";
                 return;
             }
-
 
             var nearest = remaining.OrderBy(t => t.EndTimeUtc).First();
             var rem = nearest.EndTimeUtc - now;
@@ -880,19 +890,15 @@
             {
                 _lastSecond2 = sec2;
                 if (!checkBox10.Checked)
-                    textBox9.Text = "Następna: " + rem.ToString(@"hh\:mm\:ss");
+                    textBox9.Text = Lang.T("msg.nextIn", FormatRemaining(rem));
             }
         }
 
-        private void Timer1_Tick_Reset(object sender, EventArgs e)
+        private void Timer1_Tick_Reset(object? sender, EventArgs e)
         {
-            LASTINPUTINFO lastInputInfo = new LASTINPUTINFO();
-            lastInputInfo.cbSize = LASTINPUTINFO.SizeOf;
-            GetLastInputInfo(ref lastInputInfo);
+            long idleTime = GetIdleMilliseconds();
 
-            long idleTime = (long)(Environment.TickCount64 - lastInputInfo.dwTime);
-
-            if (idleTime < 1000 && TimeSpan.TryParse(textBox4.Text, out var ts4r))
+            if (idleTime < 1000 && TryParseTime(textBox4.Text, out var ts4r))
                 timer1EndTime = DateTime.Now.Add(ts4r);
 
             var remainingTime = timer1EndTime - DateTime.Now;
@@ -902,46 +908,38 @@
                 var tasks = _taskList.Where(t => t.ActivatorType == 1 && t.Enabled).ToList();
                 foreach (var t in tasks)
                     ExecuteCommand(t.Action, 1);
-                if (!tasks.Any() && comboBox1.SelectedItem != null)
-                    ExecuteCommand(comboBox1.SelectedItem.ToString(), 1);
+                if (!tasks.Any() && comboBox1.SelectedIndex >= 0)
+                    ExecuteCommand(ActionIdFromIndex(comboBox1.SelectedIndex), 1);
 
-                if (TimeSpan.TryParse(textBox4.Text, out var ts4Reset))
+                if (TryParseTime(textBox4.Text, out var ts4Reset))
                     timer1EndTime = DateTime.Now.Add(ts4Reset);
+                else
+                    timer1EndTime = DateTime.Now.AddMinutes(5);
             }
             else if (!checkBox10.Checked)
             {
-                textBox5.Text = "Pozostały czas: " + remainingTime.ToString(@"hh\:mm\:ss");
+                textBox5.Text = Lang.T("msg.remaining", FormatRemaining(remainingTime));
             }
         }
-
 
         private void ExecuteCommand(string command, int activator = 0)
         {
 
-            string _extraCtx = command switch
-            {
-                "Odtwórz dźwięk"            => Path.GetFileName(appSettings["soundFile"] ?? ""),
-                "Otwórz stronę internetową" => appSettings[$"act{activator}_url"] ?? "",
-                "Uruchom polecenie"         => appSettings[$"act{activator}_cmd"] ?? appSettings["userSet"] ?? "",
-                "Oczyść pliki tymczasowe"   => BuildCleanupSummary(),
-                _                           => ""
-            };
-            ShowActivationBalloon(command, activator, _extraCtx);
+            ShowActivationBalloon(command, activator);
 
-
-            string actKey = activator > 0 ? $"act{activator}" : null;
+            string? actKey = activator > 0 ? $"act{activator}" : null;
             string globalCmd = System.Net.WebUtility.HtmlDecode(appSettings["userSet"] ?? "");
             string userCommand = (actKey != null && !string.IsNullOrEmpty(appSettings[$"{actKey}_cmd"]))
-                ? appSettings[$"{actKey}_cmd"]
+                ? appSettings[$"{actKey}_cmd"]!
                 : globalCmd;
 
             switch (command)
             {
                 case "Odtwórz dźwięk":
-
-                    PlaySoundFile((appSettings["soundFile"] ?? "").Trim());
+                    PlaySoundFile(ResolveSoundFor(activator));
                     break;
                 case "Uruchom polecenie":
+                    if (string.IsNullOrWhiteSpace(userCommand)) break;
                     var psi = new ProcessStartInfo
                     {
                         FileName = "cmd.exe",
@@ -949,15 +947,7 @@
                         UseShellExecute = false,
                         CreateNoWindow = true
                     };
-                    if (appSettings["userCommandBehaviour"] == "1")
-                    {
-                        var process = Process.Start(psi);
-                        process?.WaitForExit();
-                    }
-                    else
-                    {
-                        Process.Start(psi);
-                    }
+                    TryStartProcess(psi, waitForExit: appSettings["userCommandBehaviour"] == "1");
                     break;
                 case "Wyłącz monitor":
 
@@ -967,23 +957,24 @@
                         SendMessage(_monHandle, 0x0112, new IntPtr(0xF170), new IntPtr(2));
                     });
                     break;
+
                 case "Uśpienie":
-                    Process.Start("Rundll32.exe", "powrprof.dll,SetSuspendState 0,1,0");
+                    TryStartProcess("Rundll32.exe", "powrprof.dll,SetSuspendState 0,1,0");
                     break;
                 case "Wylogowanie":
-                    Process.Start("shutdown", "/l");
+                    TryStartProcess("shutdown", "/l");
                     break;
                 case "Restart":
-                    Process.Start("shutdown", "/r /t 0");
+                    TryStartProcess("shutdown", "/r /t 0");
                     break;
                 case "Wyłączenie komputera":
-                    Process.Start("shutdown", "/s /t 0");
+                    TryStartProcess("shutdown", "/s /t 0");
                     break;
                 case "Hibernacja":
-                    Process.Start("shutdown", "/h");
+                    TryStartProcess("shutdown", "/h");
                     break;
                 case "Blokada użytkownika":
-                    Process.Start("Rundll32.exe", "user32.dll,LockWorkStation");
+                    TryStartProcess("Rundll32.exe", "user32.dll,LockWorkStation");
                     break;
 
                 case "Oczyść pliki tymczasowe":
@@ -997,7 +988,6 @@
                     Task.Run(() =>
                     {
                         int deleted = 0;
-
 
                         void SafeDeleteDir(string dir)
                         {
@@ -1104,7 +1094,6 @@
                         }
                         catch { }
 
-
                         if (!string.IsNullOrEmpty(cleanSettings["cleanCustomFolders"]))
                             foreach (var customDir in cleanSettings["cleanCustomFolders"]
                                 .Split(';', StringSplitOptions.RemoveEmptyEntries)
@@ -1112,9 +1101,8 @@
                                 SafeDeleteDir(customDir);
 
                         BeginInvoke(new Action(() =>
-                            MessageBox.Show(
-                                $"Czyszczenie zakończone.\nUsunięto {deleted} plików/folderów tymczasowych.",
-                                "Wyłącznik czasowy – Czyszczenie", MessageBoxButtons.OK, MessageBoxIcon.Information)));
+                            MessageBox.Show(Lang.T("msg.cleanupDone", deleted),
+                                Lang.T("msg.cleanupTitle"), MessageBoxButtons.OK, MessageBoxIcon.Information)));
                     });
                     break;
 
@@ -1122,13 +1110,14 @@
                     try
                     {
                         string desktop = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-                        string noteFile = Path.Combine(desktop, $"Notatka_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+                        string noteFile = Path.Combine(desktop,
+                            $"{Lang.T("note.file")}_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
                         string noteContent = actKey != null ? (appSettings[$"{actKey}_note"] ?? "") : "";
-                        string content = $"Wyłącznik czasowy – wpis wygenerowany automatycznie\r\n" +
-                                         $"Data/godzina: {DateTime.Now:dd.MM.yyyy HH:mm:ss}\r\n" +
-                                         $"Komputer: {Environment.MachineName} | Użytkownik: {Environment.UserName}\r\n";
+                        string content = Lang.T("note.header") + "\r\n" +
+                                         Lang.T("note.when", DateTime.Now.ToString("dd.MM.yyyy HH:mm:ss")) + "\r\n" +
+                                         Lang.T("note.who", Environment.MachineName, Environment.UserName) + "\r\n";
                         if (!string.IsNullOrEmpty(noteContent))
-                            content += $"\r\n--- Treść notatki ---\r\n{noteContent}\r\n";
+                            content += "\r\n" + Lang.T("note.body") + "\r\n" + noteContent + "\r\n";
                         File.WriteAllText(noteFile, content, System.Text.Encoding.UTF8);
                     }
                     catch { }
@@ -1166,29 +1155,41 @@
                 case "Wykonaj zrzut ekranu":
                     Task.Run(() => TakeScreenshots());
                     break;
+
+                case ActionEmail:
+                    SendConfiguredEmail(activator);
+                    break;
             }
 
+            if (appSettings["soundEveryTask"] == "1" && command != "Odtwórz dźwięk")
+                PlaySoundFile(ResolveSoundFor(activator));
         }
 
         private void SetAutoStart(bool enabled)
         {
-            string startupFolder = Environment.GetFolderPath(Environment.SpecialFolder.Startup);
-            string shortcutPath = Path.Combine(startupFolder, "Wyłącznik czasowy.lnk");
 
-            if (enabled)
+            try
             {
-                if (!File.Exists(shortcutPath))
-                    CreateShortcutNative(shortcutPath, Application.ExecutablePath, "--minimized");
-            }
-            else
-            {
-                if (File.Exists(shortcutPath))
+                string startupFolder = Environment.GetFolderPath(Environment.SpecialFolder.Startup);
+                string shortcutPath = Path.Combine(startupFolder, "Wyłącznik czasowy.lnk");
+
+                if (enabled)
+                {
+                    if (!File.Exists(shortcutPath))
+                        CreateShortcutNative(shortcutPath, Application.ExecutablePath, "--minimized");
+                }
+                else if (File.Exists(shortcutPath))
                 {
                     File.Delete(shortcutPath);
                 }
             }
+            catch (Exception ex)
+            {
+                if (!_initializing)
+                    MessageBox.Show(Lang.T("msg.autostartError", ex.Message),
+                        Lang.T("msg.title"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         }
-
 
         private void StopSound()
         {
@@ -1199,11 +1200,16 @@
             }
             catch { }
 
-            try { new System.Media.SoundPlayer().Stop(); } catch { }
+            try
+            {
+                _wavPlayer?.Stop();
+                _wavPlayer?.Dispose();
+                _wavPlayer = null;
+            }
+            catch { }
         }
 
-
-        private void ShowActivationBalloon(string actionName, int activator = 0, string extraContext = "")
+        private void ShowActivationBalloon(string actionName, int activator = 0)
         {
             if (appSettings["noBalloon"] == "1") return;
             try
@@ -1211,18 +1217,15 @@
                 string now   = DateTime.Now.ToString("HH:mm");
                 string today = DateTime.Now.ToString("dd.MM.yyyy");
 
+                string shown = ActionDisplay(actionName);
                 string body = activator switch
                 {
-                    1 => $"Akcja \"{actionName}\" uruchomiona o {now} ({today}) po wykryciu bezczynności" +
-                         $" przez {(TimeSpan.TryParse(appSettings["timer1ActivateBy"], out var ts1) ? (int)ts1.TotalMinutes : 0)} min.",
-                    2 => $"Akcja \"{actionName}\" uruchomiona o {now} ({today}) po upłynięciu ustawionego czasu.",
-                    3 => $"Akcja \"{actionName}\" uruchomiona o {now} ({today}) zgodnie z harmonogramem ({GetScheduleDescription()}).",
-                    _ => $"Akcja \"{actionName}\" wykonana o {now} ({today})."
+                    1 => Lang.T("toast.idle", shown, now, today,
+                            TryParseTime(appSettings["timer1ActivateBy"], out var ts1) ? (int)ts1.TotalMinutes : 0),
+                    2 => Lang.T("toast.timer", shown, now, today),
+                    3 => Lang.T("toast.schedule", shown, now, today, GetScheduleDescription()),
+                    _ => Lang.T("toast.generic", shown, now, today)
                 };
-
-                if (!string.IsNullOrEmpty(extraContext))
-                    body += $" Dotyczy: {extraContext}";
-
 
                 if (InvokeRequired)
                     BeginInvoke(new Action(() => ShowCustomToast(body, actionName, activator)));
@@ -1231,7 +1234,6 @@
             }
             catch { }
         }
-
 
         private void TakeScreenshots()
         {
@@ -1288,13 +1290,12 @@
                 try
                 {
                     BeginInvoke(new Action(() =>
-                        MessageBox.Show($"Błąd zrzutu ekranu:\n{ex.Message}", "Błąd",
+                        MessageBox.Show(Lang.T("msg.screenshotError", ex.Message), Lang.T("msg.error"),
                             MessageBoxButtons.OK, MessageBoxIcon.Error)));
                 }
                 catch { }
             }
         }
-
 
         private void ShowCustomToast(string message, string actionName = "", int activator = 0)
         {
@@ -1309,8 +1310,11 @@
                 3 => Color.FromArgb(156, 39, 176),
                 _ => Color.FromArgb(0, 122, 204)
             };
-            string icon  = activator switch { 1 => "💤", 2 => "⏱", 3 => "📅", _ => "🔔" };
-            string title = string.IsNullOrEmpty(actionName) ? "Akcja aktywowana" : $"Akcja: {actionName}";
+            Ico icon = activator switch
+            { 1 => Ico.Idle, 2 => Ico.Stopwatch, 3 => Ico.Calendar, _ => Ico.Bell };
+            string title = string.IsNullOrEmpty(actionName)
+                ? Lang.T("toast.titleDefault")
+                : Lang.T("toast.titleAction", ActionDisplay(actionName));
 
             int toastW = 420, toastH = 140;
             var wa = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1920, 1080);
@@ -1330,14 +1334,14 @@
             { BackColor = barColor, Location = new Point(0, 0), Size = new Size(5, toastH) };
             toast.Controls.Add(bar);
 
-            var lblIcon = new System.Windows.Forms.Label
+            var picIcon = new PictureBox
             {
-                Text = icon, Font = new Font("Segoe UI Emoji", 18f),
-                ForeColor = barColor, BackColor = Color.Transparent,
-                Location = new Point(12, 14), Size = new Size(36, 36), AutoSize = false,
-                TextAlign = ContentAlignment.MiddleCenter
+                Image     = VectorIcons.Get(icon, 28, barColor),
+                BackColor = Color.Transparent,
+                Location  = new Point(14, 16), Size = new Size(32, 32),
+                SizeMode  = PictureBoxSizeMode.CenterImage
             };
-            toast.Controls.Add(lblIcon);
+            toast.Controls.Add(picIcon);
 
             var lblTitle = new System.Windows.Forms.Label
             {
@@ -1357,9 +1361,10 @@
 
             var btnX = new System.Windows.Forms.Button
             {
-                Text = "✕", FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 8f),
-                ForeColor = subColor, BackColor = Color.Transparent,
+                Text = "", FlatStyle = FlatStyle.Flat,
+                BackColor = Color.Transparent,
+                Image = VectorIcons.Get(Ico.Close, 10, subColor),
+                ImageAlign = ContentAlignment.MiddleCenter,
                 Location = new Point(toastW - 26, 4), Size = new Size(22, 22), TabStop = false
             };
             btnX.FlatAppearance.BorderSize = 0;
@@ -1368,7 +1373,7 @@
 
             var lblCountdown = new System.Windows.Forms.Label
             {
-                Text = "Zostanie zamknięte za 15 sek.",
+                Text = Lang.T("toast.closeIn", 15),
                 Font = new Font("Segoe UI", 7.5f),
                 ForeColor = subColor, BackColor = Color.Transparent,
                 Location = new Point(54, 90), Size = new Size(toastW - 80, 16), AutoSize = false
@@ -1389,8 +1394,19 @@
             };
             toast.Controls.Add(progressFg);
 
+            var toastFonts = new List<Font> { lblTitle.Font, lblMsg.Font, lblCountdown.Font };
+
             int finalX = wa.Right - toastW - 12;
-            int finalY = wa.Bottom - toastH - 12;
+
+            _activeToasts.RemoveAll(f => f.IsDisposed);
+            int finalY = wa.Bottom - toastH - 12 - _activeToasts.Count * (toastH + 8);
+            if (finalY < wa.Top + 8) finalY = wa.Top + 8;
+            _activeToasts.Add(toast);
+            toast.FormClosed += (s2, ev2) =>
+            {
+                _activeToasts.Remove(toast);
+                foreach (var f in toastFonts) { try { f.Dispose(); } catch { } }
+            };
             toast.Location = new Point(finalX, wa.Bottom + 5);
 
             int totalMs = 15000, remainMs = totalMs;
@@ -1410,9 +1426,9 @@
 
             toast.Show();
 
-
             int slideSteps = 12, slideStep = 0;
             double totalSlide = wa.Bottom + 5 - finalY;
+            int slideFrom = wa.Bottom + 5;
             var slideTimer = new System.Windows.Forms.Timer { Interval = 16 };
             slideTimer.Tick += (s2, ev2) =>
             {
@@ -1420,12 +1436,11 @@
                 slideStep++;
                 double t    = (double)slideStep / slideSteps;
                 double ease = 1 - Math.Pow(1 - t, 3);
-                int newY    = (int)(wa.Bottom + 5 - totalSlide * ease);
+                int newY    = (int)(slideFrom - totalSlide * ease);
                 toast.Location = new Point(finalX, newY);
                 toast.Opacity  = 0.96 * ease;
             };
             slideTimer.Start();
-
 
             var ct = new System.Windows.Forms.Timer { Interval = 100 };
             ct.Tick += (s2, ev2) =>
@@ -1439,63 +1454,62 @@
                     return;
                 }
                 int secs = (remainMs + 999) / 1000;
-                lblCountdown.Text = $"Zostanie zamknięte za {secs} sek.";
+                lblCountdown.Text = Lang.T("toast.closeIn", secs);
                 progressFg.Width  = Math.Max(0, (int)(toastW * (double)remainMs / totalMs));
             };
             ct.Start();
         }
-
 
         private string GetScheduleDescription()
         {
 
             if (_currentlyFiringTask != null && !string.IsNullOrEmpty(_currentlyFiringTask.RepeatIntervalType))
             {
-                string unit = _currentlyFiringTask.RepeatIntervalType switch
-                { "h" => "godzin", "d" => "dni", _ => "minut" };
-                return $"co {_currentlyFiringTask.RepeatIntervalValue} {unit}";
+                string unit = Lang.T(_currentlyFiringTask.RepeatIntervalType switch
+                { "h" => "unit.hours", "d" => "unit.days", _ => "unit.minutes" });
+                return Lang.T("val.every", _currentlyFiringTask.RepeatIntervalValue, unit);
             }
 
+            var labels = Lang.A("scheduleDays");
             var days = (appSettings["timer3CheckedDays"] ?? "")
                 .Split(',', StringSplitOptions.RemoveEmptyEntries)
-                .Select(p => int.TryParse(p.Trim(), out int i) && i >= 0 && i < _scheduleLabels.Length
-                    ? _scheduleLabels[i] : null)
+                .Select(p => int.TryParse(p.Trim(), out int i) && i >= 0 && i < labels.Length
+                    ? labels[i] : null)
                 .Where(s => s != null);
             string time = appSettings["timer3HourActivateBy"] ?? "?";
-            return string.Join(", ", days) + " o godz. " + time;
+            return string.Join(", ", days) + Lang.T("sched.descAt") + time;
         }
-
 
         private string BuildCleanupSummary()
         {
-            var map = new (string Key, string Label)[]
+            var map = new (string Key, string LabelKey)[]
             {
-                ("cleanTemp",        "%TEMP%"),
-                ("cleanWinTemp",     "Windows\\Temp"),
-                ("cleanDownloads",   "Pobrane"),
-                ("cleanWU",          "Windows Update"),
-                ("cleanDriverCache", "Sterowniki"),
-                ("cleanThumbs",      "Miniatury"),
-                ("cleanPrefetch",    "Prefetch"),
-                ("cleanRecycleBin",  "Kosz"),
-                ("cleanEventLog",    "Logi"),
+                ("cleanTemp",        "clean.userTemp"),
+                ("cleanWinTemp",     "clean.winTemp"),
+                ("cleanDownloads",   "clean.downloads"),
+                ("cleanWU",          "clean.wu"),
+                ("cleanDriverCache", "clean.driver"),
+                ("cleanThumbs",      "clean.thumbs"),
+                ("cleanPrefetch",    "clean.prefetch"),
+                ("cleanRecycleBin",  "clean.bin"),
+                ("cleanEventLog",    "clean.log"),
             };
-            var enabled = map.Where(x => appSettings[x.Key] != "0").Select(x => x.Label);
+            var enabled = map.Where(x => appSettings[x.Key] != "0").Select(x => Lang.T(x.LabelKey));
             var result = string.Join(", ", enabled);
-            return result.Length > 0 ? result : "brak wybranych opcji";
+            return result.Length > 0 ? result : Lang.T("clean.none");
         }
 
-
         private void UpdateComboHints(System.Windows.Forms.ComboBox combo,
-            System.Windows.Forms.Label tipLabel, System.Windows.Forms.Button btnSettings)
+            System.Windows.Forms.Label? tipLabel, System.Windows.Forms.Button? btnSettings)
         {
             int idx = combo.SelectedIndex;
-            string desc = (idx >= 0 && idx < _actionDescriptions.Length)
-                ? _actionDescriptions[idx]
-                : "Wybierz akcję z listy, aby zobaczyć jej opis.";
+            var descriptions = Lang.A("actionDesc");
+            string desc = (idx >= 0 && idx < descriptions.Length)
+                ? descriptions[idx]
+                : Lang.T("tip.pickAction");
 
             if (tipLabel != null)
-                tipLabel.Text = "WSKAZÓWKA\r\n\r\n" + desc;
+                tipLabel.Text = Lang.T("tip.header") + "\r\n\r\n" + desc;
 
             if (btnSettings != null)
             {
@@ -1504,63 +1518,48 @@
             }
         }
 
-        private void comboBox1_SelectedIndexChanged(object sender, EventArgs e)
+        private void comboBox1_SelectedIndexChanged(object? sender, EventArgs e)
         {
             appSettings["defaultAction1"] = comboBox1.SelectedIndex.ToString();
             SaveConfigFile();
             UpdateComboHints(comboBox1, tip01, _btnActSettings1);
         }
 
-        private void comboBox2_SelectedIndexChanged(object sender, EventArgs e)
+        private void comboBox2_SelectedIndexChanged(object? sender, EventArgs e)
         {
             appSettings["defaultAction2"] = comboBox2.SelectedIndex.ToString();
             SaveConfigFile();
             UpdateComboHints(comboBox2, tip02, _btnActSettings2);
         }
 
-        private void comboBox3_SelectedIndexChanged(object sender, EventArgs e)
+        private void comboBox3_SelectedIndexChanged(object? sender, EventArgs e)
         {
             appSettings["defaultAction3"] = comboBox3.SelectedIndex.ToString();
             SaveConfigFile();
             UpdateComboHints(comboBox3, tip03, _btnActSettings3);
         }
 
-
-        private static readonly string[] _actionDescriptions = {
-            "Odtwarza plik dźwiękowy. Możesz wskazać własny plik (WAV, MP3, AAC, OGG).\nJeśli nic nie wybrano – program użyje pliku z folderu 'sounds/' lub systemowego dźwięku.",
-            "Uruchamia polecenie lub program. Możesz ustawić oddzielne polecenie\ndla każdego aktywatora (niezależnie od globalnego ustawienia).",
-            "Wyłącza ekran monitora bez usypiania komputera.",
-            "Przełącza komputer w tryb uśpienia.",
-            "Wylogowuje bieżącego użytkownika z systemu Windows.",
-            "Restartuje komputer natychmiast.",
-            "Wyłącza komputer natychmiast.",
-            "Hibernuje komputer – stan RAM zapisywany na dysk, następnie wyłączenie. Opcja zadziała tylko jeśli hibernacja jest włączona w systemie.",
-            "Blokuje ekran użytkownika. Ekran blokady może wymagać wprowadzenia hasła aby zalogować się do systemu.",
-            "Usuwa całą zawartość niepotrzebnych plików tymczasowych.",
-            "Tworzy plik tekstowy na pulpicie z datą, godziną i opcjonalną treścią notatki.",
-            "Otwiera wskazany adres URL w domyślnej przeglądarce.",
-            "Opróżnia Kosz bez potwierdzenia.",
-            "Wykonuje zrzut ekranu i zapisuje go w wybranym folderze.\nMożna ustawić format (PNG/JPG/BMP/GIF), liczbę zrzutów, opóźnienie, interwał i kompresję ZIP.",
-        };
-
-        private static bool ActionHasParams(int idx) => idx == 0 || idx == 1 || idx == 9 || idx == 10 || idx == 11 || idx == 13;
+        private static bool ActionHasParams(int idx) =>
+            idx == 0 || idx == 1 || idx == 9 || idx == 10 || idx == 11 || idx == 13 || idx == 14;
 
         private void ShowActionSettingsDialog(System.Windows.Forms.ComboBox combo, int activatorNum)
         {
             int idx = combo.SelectedIndex;
-            string desc = (idx >= 0 && idx < _actionDescriptions.Length) ? _actionDescriptions[idx] : "";
+            var descriptions = Lang.A("actionDesc");
+            string desc = (idx >= 0 && idx < descriptions.Length) ? descriptions[idx] : "";
 
-
-            if (idx == 0) { ShowSoundSettingsDialog(); return; }
+            if (idx == 0) { ShowSoundSettingsDialog(activatorNum); return; }
 
             if (idx == 9) { ShowCleanupSettingsDialog(); return; }
 
             if (idx == 13) { ShowScreenshotSettingsDialog(); return; }
 
+            if (idx == 14) { ShowEmailActionDialog(activatorNum); return; }
+
             string actKey = $"act{activatorNum}";
-            string paramLabel = idx == 1 ? "Polecenie lub ścieżka do pliku/skryptu:" :
-                                idx == 10 ? "Treść notatki (opcjonalnie – zapisana w pliku TXT):" :
-                                idx == 11 ? "Adres URL do otwarcia (np. https://www.example.com):" : "";
+            string paramLabel = idx == 1  ? Lang.T("dlg.commandParam") :
+                                idx == 10 ? Lang.T("dlg.noteParam") :
+                                idx == 11 ? Lang.T("dlg.urlParam") : "";
             string configKey = idx == 1 ? $"{actKey}_cmd" :
                                idx == 10 ? $"{actKey}_note" :
                                idx == 11 ? $"{actKey}_url" : "";
@@ -1568,9 +1567,9 @@
             bool isNote = idx == 10;
             bool hasParams = ActionHasParams(idx);
 
-            var dlg = new Form
+            using var dlg = new Form
             {
-                Text = $"Ustawienia akcji – {(combo.SelectedItem?.ToString() ?? "")}",
+                Text = Lang.T("dlg.actionSettings", combo.SelectedItem?.ToString() ?? ""),
                 FormBorderStyle = FormBorderStyle.FixedDialog,
                 StartPosition = FormStartPosition.CenterParent,
                 MaximizeBox = false,
@@ -1586,7 +1585,7 @@
             {
                 dlg.ClientSize = new Size(480, 140);
                 var btnOk0 = new System.Windows.Forms.Button
-                { Text = "Zamknij", DialogResult = DialogResult.OK, Location = new Point(185, 98), Size = new Size(90, 28) };
+                { Text = Lang.T("dlg.close"), DialogResult = DialogResult.OK, Location = new Point(185, 98), Size = new Size(90, 28) };
                 dlg.Controls.Add(btnOk0); dlg.AcceptButton = btnOk0;
                 if (checkBox11.Checked) ApplyThemeToControls(dlg.Controls, Color.FromArgb(30, 30, 30), Color.FromArgb(220, 220, 220), Color.FromArgb(55, 55, 55), true);
                 dlg.ShowDialog(this); return;
@@ -1609,10 +1608,11 @@
             if (idx == 1)
             {
                 var btnBrw = new System.Windows.Forms.Button
-                { Text = "📂", Location = new Point(txtValue.Right + 4, 88), Size = new Size(30, 25), FlatStyle = FlatStyle.Flat };
+                { Text = "", Location = new Point(txtValue.Right + 4, 88), Size = new Size(30, 25), FlatStyle = FlatStyle.Flat };
+                SetIcon(btnBrw, Ico.Folder, 16);
                 btnBrw.Click += (s, ev) =>
                 {
-                    using var ofd = new OpenFileDialog { Filter = "Programy i skrypty|*.exe;*.bat;*.cmd;*.ps1;*.vbs|Wszystkie pliki|*.*", Title = "Wybierz plik do uruchomienia" };
+                    using var ofd = new OpenFileDialog { Filter = Lang.T("dlg.filterPrograms"), Title = Lang.T("dlg.pickProgram") };
                     if (ofd.ShowDialog() == DialogResult.OK) txtValue.Text = ofd.FileName;
                 };
                 dlg.Controls.Add(btnBrw);
@@ -1621,15 +1621,14 @@
             int btnY = isNote ? (88 + 80 + 12) : 124;
             dlg.ClientSize = new Size(480, btnY + 48);
 
-            var btnSave = new System.Windows.Forms.Button { Text = "Zapisz", Location = new Point(12, btnY), Size = new Size(90, 28), FlatStyle = FlatStyle.Flat };
-            var btnCancel2 = new System.Windows.Forms.Button { Text = "Anuluj", Location = new Point(108, btnY), Size = new Size(90, 28), FlatStyle = FlatStyle.Flat, DialogResult = DialogResult.Cancel };
+            var btnSave = new System.Windows.Forms.Button { Text = Lang.T("dlg.save"), Location = new Point(12, btnY), Size = new Size(90, 28), FlatStyle = FlatStyle.Flat };
+            var btnCancel2 = new System.Windows.Forms.Button { Text = Lang.T("dlg.cancel"), Location = new Point(108, btnY), Size = new Size(90, 28), FlatStyle = FlatStyle.Flat, DialogResult = DialogResult.Cancel };
             btnSave.Click += (s, ev) => { appSettings[configKey] = txtValue.Text.Trim(); SaveConfigFile(); dlg.DialogResult = DialogResult.OK; dlg.Close(); };
             dlg.Controls.Add(btnSave); dlg.Controls.Add(btnCancel2);
             dlg.AcceptButton = btnSave; dlg.CancelButton = btnCancel2;
             if (checkBox11.Checked) ApplyThemeToControls(dlg.Controls, Color.FromArgb(30, 30, 30), Color.FromArgb(220, 220, 220), Color.FromArgb(55, 55, 55), true);
             dlg.ShowDialog(this);
         }
-
 
         private void ShowScreenshotSettingsDialog()
         {
@@ -1641,9 +1640,9 @@
             string zipKey = "ss_compress";
             string dirKey = "ss_folder";
 
-            var dlg = new Form
+            using var dlg = new Form
             {
-                Text = "Ustawienia – Wykonaj zrzut ekranu",
+                Text = Lang.T("dlg.ssTitle"),
                 ClientSize = new Size(420, 290),
                 FormBorderStyle = FormBorderStyle.FixedDialog,
                 StartPosition = FormStartPosition.CenterParent,
@@ -1666,33 +1665,34 @@
             cboFmt.Items.AddRange(new object[] { "PNG", "JPG", "BMP", "GIF" });
             string curFmt = appSettings[fmtKey] ?? "PNG";
             cboFmt.SelectedIndex = Math.Max(0, cboFmt.Items.IndexOf(curFmt));
-            AddRow("Format pliku:", cboFmt);
+            AddRow(Lang.T("dlg.ssFormat"), cboFmt);
 
             var nudCount = new System.Windows.Forms.NumericUpDown
             { Minimum = 1, Maximum = 99, Value = int.TryParse(appSettings[cntKey], out int cv) ? Math.Max(1, cv) : 1 };
-            AddRow("Liczba zrzutów:", nudCount);
+            AddRow(Lang.T("dlg.ssCount"), nudCount);
 
             var nudDelay = new System.Windows.Forms.NumericUpDown
             { Minimum = 0, Maximum = 60000, Increment = 500, Value = int.TryParse(appSettings[dlyKey], out int dv) ? dv : 0 };
-            AddRow("Opóźnienie (ms):", nudDelay);
+            AddRow(Lang.T("dlg.ssDelay"), nudDelay);
 
             var nudInterval = new System.Windows.Forms.NumericUpDown
             { Minimum = 100, Maximum = 60000, Increment = 500, Value = int.TryParse(appSettings[intKey], out int iv) ? iv : 1000 };
-            AddRow("Interwał (ms):", nudInterval);
+            AddRow(Lang.T("dlg.ssInterval"), nudInterval);
 
             var chkZip = new System.Windows.Forms.CheckBox
-            { Text = "Spakuj do pliku ZIP", Checked = appSettings[zipKey] == "1", Location = new Point(150, row), AutoSize = true };
+            { Text = Lang.T("dlg.ssZip"), Checked = appSettings[zipKey] == "1", Location = new Point(150, row), AutoSize = true };
             dlg.Controls.Add(chkZip);
             row += 32;
 
             var txtFolder = new System.Windows.Forms.TextBox { Text = appSettings[dirKey] ?? "" };
             txtFolder.Location = new Point(150, row);
             txtFolder.Size = new Size(215, 23);
-            var lbFolder = new System.Windows.Forms.Label { Text = "Folder docelowy:", Location = new Point(12, row + 3), AutoSize = true };
+            var lbFolder = new System.Windows.Forms.Label { Text = Lang.T("dlg.ssFolder"), Location = new Point(12, row + 3), AutoSize = true };
             dlg.Controls.Add(lbFolder);
             dlg.Controls.Add(txtFolder);
             var btnBrowse = new System.Windows.Forms.Button
-            { Text = "…", Location = new Point(368, row), Size = new Size(28, 23), FlatStyle = FlatStyle.Flat };
+            { Text = "", Location = new Point(368, row), Size = new Size(28, 23), FlatStyle = FlatStyle.Flat };
+            SetIcon(btnBrowse, Ico.Folder, 14);
             dlg.Controls.Add(btnBrowse);
             btnBrowse.Click += (s2, ev2) =>
             {
@@ -1702,9 +1702,9 @@
             row += 36;
 
             var btnOk2 = new System.Windows.Forms.Button
-            { Text = "Zapisz", Location = new Point(150, row), Size = new Size(88, 28), FlatStyle = FlatStyle.Flat };
+            { Text = Lang.T("dlg.save"), Location = new Point(150, row), Size = new Size(88, 28), FlatStyle = FlatStyle.Flat };
             var btnCancel3 = new System.Windows.Forms.Button
-            { Text = "Anuluj", Location = new Point(244, row), Size = new Size(88, 28), FlatStyle = FlatStyle.Flat, DialogResult = DialogResult.Cancel };
+            { Text = Lang.T("dlg.cancel"), Location = new Point(244, row), Size = new Size(88, 28), FlatStyle = FlatStyle.Flat, DialogResult = DialogResult.Cancel };
             btnOk2.Click += (s2, ev2) =>
             {
                 appSettings[fmtKey] = cboFmt.Text;
@@ -1728,16 +1728,15 @@
             dlg.ShowDialog(this);
         }
 
-
         private (string type, int value) ShowRepeatIntervalDialog()
         {
             bool dark    = appSettings["darkModeEnabled"] == "1";
             string sType = appSettings["timer3_repeat_type"]  ?? "m";
             int    sVal  = int.TryParse(appSettings["timer3_repeat_value"], out int sv) ? sv : 30;
 
-            var dlg = new Form
+            using var dlg = new Form
             {
-                Text            = "Powtarzaj co...",
+                Text            = Lang.T("dlg.repeatTitle"),
                 ClientSize      = new Size(320, 160),
                 FormBorderStyle = FormBorderStyle.FixedDialog,
                 StartPosition   = FormStartPosition.CenterParent,
@@ -1746,26 +1745,26 @@
             };
 
             dlg.Controls.Add(new System.Windows.Forms.Label
-            { Text = "Powtarzaj akcje co:", Location = new Point(12, 14), AutoSize = true });
+            { Text = Lang.T("dlg.repeatLabel"), Location = new Point(12, 14), AutoSize = true });
 
             var nud = new System.Windows.Forms.NumericUpDown
             { Minimum = 1, Maximum = 99999, Value = Math.Max(1, sVal),
               Location = new Point(12, 40), Size = new Size(80, 23) };
             dlg.Controls.Add(nud);
 
-            var rbMin  = new System.Windows.Forms.RadioButton { Text = "minut",  Location = new Point(102, 41), AutoSize = true, Checked = sType == "m" };
-            var rbHour = new System.Windows.Forms.RadioButton { Text = "godzin", Location = new Point(172, 41), AutoSize = true, Checked = sType == "h" };
-            var rbDay  = new System.Windows.Forms.RadioButton { Text = "dni",    Location = new Point(242, 41), AutoSize = true, Checked = sType == "d" };
+            var repUnits = Lang.A("repeatUnits");
+            var rbMin  = new System.Windows.Forms.RadioButton { Text = repUnits[0], Location = new Point(102, 41), AutoSize = true, Checked = sType == "m" };
+            var rbHour = new System.Windows.Forms.RadioButton { Text = repUnits[1], Location = new Point(176, 41), AutoSize = true, Checked = sType == "h" };
+            var rbDay  = new System.Windows.Forms.RadioButton { Text = repUnits[2], Location = new Point(250, 41), AutoSize = true, Checked = sType == "d" };
             dlg.Controls.Add(rbMin); dlg.Controls.Add(rbHour); dlg.Controls.Add(rbDay);
-
 
             if (!rbMin.Checked && !rbHour.Checked && !rbDay.Checked) rbMin.Checked = true;
 
             string resultType = ""; int resultValue = 0;
             var btnOk = new System.Windows.Forms.Button
-            { Text = "Zapisz", Location = new Point(70, 110), Size = new Size(80, 28), FlatStyle = FlatStyle.Flat };
+            { Text = Lang.T("dlg.save"), Location = new Point(70, 110), Size = new Size(80, 28), FlatStyle = FlatStyle.Flat };
             var btnCancel = new System.Windows.Forms.Button
-            { Text = "Anuluj", Location = new Point(162, 110), Size = new Size(80, 28),
+            { Text = Lang.T("dlg.cancel"), Location = new Point(162, 110), Size = new Size(80, 28),
               FlatStyle = FlatStyle.Flat, DialogResult = DialogResult.Cancel };
             btnOk.Click += (s2, ev2) =>
             {
@@ -1785,52 +1784,176 @@
             return (resultType, resultValue);
         }
 
-        private void ShowSoundSettingsDialog()
+        private void ShowSoundSettingsDialog(int activatorNum)
         {
-            var dlg = new Form
+            string modeName = Lang.T(activatorNum switch
             {
-                Text = "Plik dźwiękowy – wspólny dla wszystkich aktywatorów",
-                ClientSize = new Size(480, 185),
+                2 => "mode.timer",
+                3 => "mode.schedule",
+                _ => "mode.idle"
+            });
+
+            using var dlg = new Form
+            {
+                Text            = Lang.T("dlg.soundTitle"),
+                ClientSize      = new Size(500, 272),
                 FormBorderStyle = FormBorderStyle.FixedDialog,
-                StartPosition = FormStartPosition.CenterParent,
-                MaximizeBox = false,
-                MinimizeBox = false,
-                BackColor = this.BackColor
+                StartPosition   = FormStartPosition.CenterParent,
+                MaximizeBox     = false,
+                MinimizeBox     = false,
+                ShowInTaskbar   = false,
+                Icon            = this.Icon,
+                BackColor       = this.BackColor
             };
-            var lblInfo = new System.Windows.Forms.Label
+
+            dlg.Controls.Add(new System.Windows.Forms.Label
             {
-                Text = "Wybierz plik dźwiękowy odtwarzany przez WSZYSTKIE aktywatory.\nJeśli pole jest puste – użyty zostanie plik z folderu 'sounds/' lub systemowy.",
-                Location = new Point(12, 10),
-                Size = new Size(456, 40),
+                Text     = Lang.T("snd.hint"),
+                Location = new Point(14, 12),
+                Size     = new Size(472, 36),
                 AutoSize = false
+            });
+
+            var chkShared = new System.Windows.Forms.CheckBox
+            {
+                Text     = Lang.T("snd.useShared"),
+                Location = new Point(14, 54),
+                Size     = new Size(472, 21),
+                Checked  = activatorNum <= 0 ||
+                           string.IsNullOrWhiteSpace(appSettings[$"act{activatorNum}_sound"]),
+                Enabled  = activatorNum > 0
             };
-            dlg.Controls.Add(lblInfo);
-            var lblPath = new System.Windows.Forms.Label { Text = "Ścieżka do pliku (WAV, MP3, AAC, OGG, WMA, FLAC):", Location = new Point(12, 58), AutoSize = true };
+            dlg.Controls.Add(chkShared);
+
+            var lblTarget = new System.Windows.Forms.Label
+            {
+                Location = new Point(14, 86),
+                Size     = new Size(472, 17),
+                AutoSize = false,
+                Font     = new Font("Segoe UI", 9f, FontStyle.Bold)
+            };
+            dlg.Controls.Add(lblTarget);
+
+            dlg.Controls.Add(new System.Windows.Forms.Label
+            { Text = Lang.T("snd.list"), Location = new Point(14, 112), AutoSize = true });
+
+            var cbo = new System.Windows.Forms.ComboBox
+            {
+                Location      = new Point(14, 132),
+                Size          = new Size(472, 25),
+                DropDownStyle = ComboBoxStyle.DropDownList
+            };
+            foreach (var f in SoundCatalog.Files) cbo.Items.Add(SoundCatalog.DisplayName(f));
+            cbo.Items.Add(Lang.T("snd.custom"));
+            int customIndex = cbo.Items.Count - 1;
+            dlg.Controls.Add(cbo);
+
+            var lblPath = new System.Windows.Forms.Label
+            { Text = Lang.T("snd.customPath"), Location = new Point(14, 166), AutoSize = true };
             dlg.Controls.Add(lblPath);
-            var txtFile = new TextBox { Text = appSettings["soundFile"] ?? "", Location = new Point(12, 76), Size = new Size(396, 25) };
+
+            var txtFile = new TextBox { Location = new Point(14, 186), Size = new Size(434, 25) };
             dlg.Controls.Add(txtFile);
-            var btnBrw = new System.Windows.Forms.Button { Text = "📂", Location = new Point(414, 76), Size = new Size(30, 25), FlatStyle = FlatStyle.Flat };
+
+            var btnBrw = new System.Windows.Forms.Button
+            { Text = "", Location = new Point(454, 186), Size = new Size(32, 25), FlatStyle = FlatStyle.Flat };
+            SetIcon(btnBrw, Ico.Folder, 16);
             btnBrw.Click += (s, ev) =>
             {
-                using var ofd = new OpenFileDialog { Filter = "Pliki dźwiękowe|*.wav;*.mp3;*.aac;*.ogg;*.wma;*.flac|Wszystkie pliki|*.*", Title = "Wybierz plik dźwiękowy" };
-                if (ofd.ShowDialog() == DialogResult.OK) txtFile.Text = ofd.FileName;
+                using var ofd = new OpenFileDialog { Filter = Lang.T("dlg.soundFilter"), Title = Lang.T("dlg.soundPick") };
+                if (ofd.ShowDialog(dlg) == DialogResult.OK)
+                {
+                    txtFile.Text = ofd.FileName;
+                    cbo.SelectedIndex = customIndex;
+                }
             };
             dlg.Controls.Add(btnBrw);
-            var btnPlay = new System.Windows.Forms.Button { Text = "▶ Test", Location = new Point(12, 110), Size = new Size(80, 26), FlatStyle = FlatStyle.Flat };
-            btnPlay.Click += (s, ev) => PlaySoundFile(txtFile.Text.Trim());
+
+            void LoadValue()
+            {
+                string value = chkShared.Checked
+                    ? (appSettings["soundFile"] ?? "").Trim()
+                    : (appSettings[$"act{activatorNum}_sound"] ?? "").Trim();
+                if (string.IsNullOrEmpty(value)) value = SoundCatalog.DefaultFile;
+
+                int idx = SoundCatalog.Files.ToList()
+                    .FindIndex(f => string.Equals(f, value, StringComparison.OrdinalIgnoreCase));
+                if (idx >= 0)
+                {
+                    cbo.SelectedIndex = idx;
+                    txtFile.Text = "";
+                }
+                else
+                {
+                    cbo.SelectedIndex = customIndex;
+                    txtFile.Text = value;
+                }
+
+                lblTarget.Text = chkShared.Checked
+                    ? Lang.T("snd.shared")
+                    : Lang.T("snd.forMode", modeName);
+            }
+
+            void UpdateCustomState()
+            {
+                bool custom = cbo.SelectedIndex == customIndex;
+                lblPath.Enabled = custom;
+                txtFile.Enabled = custom;
+                btnBrw.Enabled  = custom;
+            }
+
+            string CurrentValue() => cbo.SelectedIndex == customIndex
+                ? txtFile.Text.Trim()
+                : SoundCatalog.Files[Math.Max(0, cbo.SelectedIndex)];
+
+            cbo.SelectedIndexChanged += (s, ev) => UpdateCustomState();
+            chkShared.CheckedChanged += (s, ev) => { LoadValue(); UpdateCustomState(); };
+            LoadValue();
+            UpdateCustomState();
+
+            var btnPlay = new System.Windows.Forms.Button
+            { Text = Lang.T("dlg.soundTest"), Location = new Point(14, 224), Size = new Size(110, 30), FlatStyle = FlatStyle.Flat };
+            SetIcon(btnPlay, Ico.Play, 14);
+            btnPlay.Click += (s, ev) => PlaySoundFile(SoundCatalog.ResolvePath(CurrentValue()));
             dlg.Controls.Add(btnPlay);
-            var btnStop = new System.Windows.Forms.Button { Text = "⏹ Stop", Location = new Point(98, 110), Size = new Size(80, 26), FlatStyle = FlatStyle.Flat };
+
+            var btnStop = new System.Windows.Forms.Button
+            { Text = Lang.T("dlg.soundStop"), Location = new Point(132, 224), Size = new Size(110, 30), FlatStyle = FlatStyle.Flat };
+            SetIcon(btnStop, Ico.Stop, 14);
             btnStop.Click += (s, ev) => StopSound();
             dlg.Controls.Add(btnStop);
-            var btnSave = new System.Windows.Forms.Button { Text = "Zapisz", Location = new Point(12, 146), Size = new Size(90, 28), FlatStyle = FlatStyle.Flat };
-            var btnCancel = new System.Windows.Forms.Button { Text = "Anuluj", Location = new Point(108, 146), Size = new Size(90, 28), FlatStyle = FlatStyle.Flat, DialogResult = DialogResult.Cancel };
-            btnSave.Click += (s, ev) => { appSettings["soundFile"] = txtFile.Text.Trim(); SaveConfigFile(); StopSound(); dlg.DialogResult = DialogResult.OK; dlg.Close(); };
-            dlg.Controls.Add(btnSave); dlg.Controls.Add(btnCancel);
-            dlg.AcceptButton = btnSave; dlg.CancelButton = btnCancel;
-            if (checkBox11.Checked) ApplyThemeToControls(dlg.Controls, Color.FromArgb(30, 30, 30), Color.FromArgb(220, 220, 220), Color.FromArgb(55, 55, 55), true);
-            dlg.ShowDialog(this);
-        }
 
+            var btnSave = new System.Windows.Forms.Button
+            { Text = Lang.T("dlg.save"), Location = new Point(286, 224), Size = new Size(96, 30), FlatStyle = FlatStyle.Flat };
+            var btnCancel = new System.Windows.Forms.Button
+            { Text = Lang.T("dlg.cancel"), Location = new Point(390, 224), Size = new Size(96, 30), FlatStyle = FlatStyle.Flat, DialogResult = DialogResult.Cancel };
+            btnSave.Click += (s, ev) =>
+            {
+                string value = CurrentValue();
+                if (chkShared.Checked)
+                {
+                    appSettings["soundFile"] = value;
+                    if (activatorNum > 0) appSettings[$"act{activatorNum}_sound"] = "";
+                }
+                else
+                {
+                    appSettings[$"act{activatorNum}_sound"] = value;
+                }
+                SaveConfigFile();
+                StopSound();
+                dlg.DialogResult = DialogResult.OK;
+                dlg.Close();
+            };
+            dlg.Controls.Add(btnSave);
+            dlg.Controls.Add(btnCancel);
+            dlg.AcceptButton = btnSave;
+            dlg.CancelButton = btnCancel;
+
+            if (checkBox11.Checked) ApplyThemeToControls(dlg.Controls,
+                Color.FromArgb(30, 30, 30), Color.FromArgb(220, 220, 220), Color.FromArgb(55, 55, 55), true);
+            dlg.ShowDialog(this);
+            StopSound();
+        }
 
         private static bool IsAdmin()
         {
@@ -1841,24 +1964,24 @@
 
         private void ShowCleanupSettingsDialog()
         {
-            var options = new (string Key, string Label, string Tip, bool NeedsAdmin)[]
+            var options = new (string Key, string LabelKey, string TipKey, bool NeedsAdmin)[]
             {
-                ("cleanTemp",        "Pliki tymczasowe użytkownika (%TEMP%)",               "Folder %TEMP% – tymczasowe pliki programów i systemu",                      false),
-                ("cleanWinTemp",     "Pliki tymczasowe systemu Windows (C:\\Windows\\Temp)", "C:\\Windows\\Temp – tymczasowe pliki systemu operacyjnego",                  true),
-                ("cleanDownloads",   "Folder Pobrane (Downloads) – pliki użytkownika",       "Usuwa wszystkie pliki z folderu Pobrane (nie foldery!)",                     false),
-                ("cleanWU",          "Cache Windows Update (SoftwareDistribution\\Download)","Pobrane, ale niezainstalowane aktualizacje Windows",                         true),
-                ("cleanDriverCache", "Cache sterowników (DriverStore\\Temp)",                "Tymczasowe pliki sterowników urządzeń",                                      true),
-                ("cleanThumbs",      "Miniatury obrazków (thumbcache_*.db)",                 "Baza miniatur Eksploratora – bezpiecznie usuwalna",                          false),
-                ("cleanPrefetch",    "Pliki Prefetch (*.pf)",                                "Pliki przyspieszające uruchamianie programów; system odtworzy je automatycznie", false),
-                ("cleanRecycleBin",  "Kosz systemowy (wszystkich dysków)",                   "Opróżnia Kosz – odpowiednik Shift+Del",                                     false),
-                ("cleanEventLog",    "Dzienniki zdarzeń Windows (Event Log)",               "Czyści logi systemowe – przydatne do odzyskania miejsca",                   true),
+                ("cleanTemp",        "clean.userTemp",  "clean.userTempTip",  false),
+                ("cleanWinTemp",     "clean.winTemp",   "clean.winTempTip",   true),
+                ("cleanDownloads",   "clean.downloads", "clean.downloadsTip", false),
+                ("cleanWU",          "clean.wu",        "clean.wuTip",        true),
+                ("cleanDriverCache", "clean.driver",    "clean.driverTip",    true),
+                ("cleanThumbs",      "clean.thumbs",    "clean.thumbsTip",    false),
+                ("cleanPrefetch",    "clean.prefetch",  "clean.prefetchTip",  false),
+                ("cleanRecycleBin",  "clean.bin",       "clean.binTip",       false),
+                ("cleanEventLog",    "clean.log",       "clean.logTip",       true),
             };
 
             bool adminNow = IsAdmin();
 
-            var dlg = new Form
+            using var dlg = new Form
             {
-                Text = "Czyszczenie plików – wybierz co usuwać",
+                Text = Lang.T("dlg.cleanTitle"),
                 ClientSize = new Size(520, options.Length * 28 + 210),
                 FormBorderStyle = FormBorderStyle.FixedDialog,
                 StartPosition = FormStartPosition.CenterParent,
@@ -1866,7 +1989,7 @@
                 MinimizeBox = false,
                 BackColor = this.BackColor
             };
-            var tip = new System.Windows.Forms.ToolTip();
+            using var tip = new System.Windows.Forms.ToolTip();
             var checkboxes = new List<System.Windows.Forms.CheckBox>();
             int y = 10;
             foreach (var opt in options)
@@ -1874,7 +1997,7 @@
                 bool disabled = opt.NeedsAdmin && !adminNow;
                 var cb = new System.Windows.Forms.CheckBox
                 {
-                    Text = opt.Label + (disabled ? "  [⚠ wymaga administratora]" : ""),
+                    Text = Lang.T(opt.LabelKey) + (disabled ? Lang.T("dlg.needsAdmin") : ""),
                     Checked = !disabled && appSettings[opt.Key] != "0",
                     Enabled = !disabled,
                     Location = new Point(12, y),
@@ -1882,19 +2005,16 @@
                     Tag = opt.Key,
                     ForeColor = disabled ? Color.Gray : SystemColors.ControlText
                 };
-                tip.SetToolTip(cb, disabled
-                    ? opt.Tip + "\n⚠ Ta opcja wymaga uprawnień administratora."
-                    : opt.Tip);
+                tip.SetToolTip(cb, Lang.T(opt.TipKey) + (disabled ? Lang.T("dlg.needsAdminTip") : ""));
                 dlg.Controls.Add(cb);
                 checkboxes.Add(cb);
                 y += 28;
             }
 
-
             y += 6;
             dlg.Controls.Add(new System.Windows.Forms.Label
             {
-                Text = "Dodatkowe foldery do wyczyszczenia:",
+                Text = Lang.T("dlg.cleanExtra"),
                 Location = new Point(12, y),
                 AutoSize = true,
                 Font = new Font("Segoe UI", 9f, FontStyle.Bold)
@@ -1915,22 +2035,23 @@
 
             var btnAddFolder = new System.Windows.Forms.Button
             {
-                Text = "+ Dodaj",
+                Text = Lang.T("dlg.cleanAdd"),
                 Location = new Point(412, y),
                 Size = new Size(96, 32),
                 FlatStyle = FlatStyle.Flat
             };
             btnAddFolder.Click += (s, ev) =>
             {
-                using var fbd = new FolderBrowserDialog { Description = "Wybierz folder do wyczyszczenia", UseDescriptionForTitle = true };
+                using var fbd = new FolderBrowserDialog { Description = Lang.T("dlg.cleanPickDir"), UseDescriptionForTitle = true };
                 if (fbd.ShowDialog(dlg) == DialogResult.OK && !customFolderList.Items.Contains(fbd.SelectedPath))
                     customFolderList.Items.Add(fbd.SelectedPath);
             };
+            SetIcon(btnAddFolder, Ico.Plus, 14);
             dlg.Controls.Add(btnAddFolder);
 
             var btnRemoveFolder = new System.Windows.Forms.Button
             {
-                Text = "✕ Usuń",
+                Text = Lang.T("dlg.cleanRemove"),
                 Location = new Point(412, y + 36),
                 Size = new Size(96, 32),
                 FlatStyle = FlatStyle.Flat
@@ -1940,37 +2061,36 @@
                 if (customFolderList.SelectedIndex >= 0)
                     customFolderList.Items.RemoveAt(customFolderList.SelectedIndex);
             };
+            SetIcon(btnRemoveFolder, Ico.Close, 14);
             dlg.Controls.Add(btnRemoveFolder);
             y += 78;
-            var btnSave = new System.Windows.Forms.Button { Text = "Zapisz", Location = new Point(12, y + 8), Size = new Size(90, 28), FlatStyle = FlatStyle.Flat };
-            var btnCancel = new System.Windows.Forms.Button { Text = "Anuluj", Location = new Point(108, y + 8), Size = new Size(90, 28), FlatStyle = FlatStyle.Flat, DialogResult = DialogResult.Cancel };
+            var btnSave = new System.Windows.Forms.Button { Text = Lang.T("dlg.save"), Location = new Point(12, y + 8), Size = new Size(90, 28), FlatStyle = FlatStyle.Flat };
+            var btnCancel = new System.Windows.Forms.Button { Text = Lang.T("dlg.cancel"), Location = new Point(108, y + 8), Size = new Size(90, 28), FlatStyle = FlatStyle.Flat, DialogResult = DialogResult.Cancel };
             btnSave.Click += (s, ev) =>
             {
                 foreach (var cb in checkboxes)
-                    appSettings[(string)cb.Tag] = cb.Checked ? "1" : "0";
+                    appSettings[cb.Tag as string ?? ""] = cb.Checked ? "1" : "0";
 
                 appSettings["cleanCustomFolders"] = string.Join(";", customFolderList.Items.Cast<string>());
                 SaveConfigFile();
                 dlg.DialogResult = DialogResult.OK; dlg.Close();
             };
 
-
             var btnAdmin = new System.Windows.Forms.Button
             {
-                Text = adminNow ? "✓ Uruchomiony jako administrator" : "🛡 Uruchom jako administrator",
+                Text = Lang.T(adminNow ? "dlg.runningAsAdmin" : "dlg.runAsAdminNow"),
                 Enabled = !adminNow,
                 Location = new Point(210, y + 8),
                 Size = new Size(288, 28),
                 FlatStyle = FlatStyle.Flat
             };
-            tip.SetToolTip(btnAdmin, adminNow
-                ? "Program już działa z uprawnieniami administratora."
-                : "Zapisuje ustawienia i restartuje program z uprawnieniami administratora (wymagany monit UAC).");
+            SetIcon(btnAdmin, adminNow ? Ico.Check : Ico.Shield);
+            tip.SetToolTip(btnAdmin, Lang.T(adminNow ? "tip.runAsAdminOn" : "dlg.runAsAdminTip"));
             btnAdmin.Click += (s, ev) =>
             {
 
                 foreach (var cb in checkboxes)
-                    appSettings[(string)cb.Tag] = cb.Checked ? "1" : "0";
+                    appSettings[cb.Tag as string ?? ""] = cb.Checked ? "1" : "0";
                 SaveConfigFile();
 
                 try
@@ -2000,13 +2120,12 @@
             dlg.ShowDialog(this);
         }
 
-
         private void ShowBackupRestoreDialog()
         {
             bool dark = appSettings["darkModeEnabled"] == "1";
-            var dlg = new Form
+            using var dlg = new Form
             {
-                Text = "Kopia zapasowa / Przywróć ustawienia",
+                Text = Lang.T("dlg.backupTitle"),
                 ClientSize = new Size(440, 195),
                 FormBorderStyle = FormBorderStyle.FixedDialog,
                 StartPosition = FormStartPosition.CenterParent,
@@ -2016,22 +2135,22 @@
 
             dlg.Controls.Add(new System.Windows.Forms.Label
             {
-                Text = "Utwórz lub przywróć kopię zapasową ustawień programu\n(konfiguracja, hasło ochronne). Przy przywracaniu program zostanie zamknięty.",
+                Text = Lang.T("dlg.backupInfo"),
                 Location = new Point(12, 12), Size = new Size(416, 36), AutoSize = false
             });
 
             var btnBackup = new System.Windows.Forms.Button
             {
-                Text = "💾 Utwórz kopię zapasową...",
+                Text = Lang.T("dlg.backupCreate"),
                 Location = new Point(12, 58), Size = new Size(200, 36), FlatStyle = FlatStyle.Flat
             };
             btnBackup.Click += (s, ev) =>
             {
                 using var sfd = new SaveFileDialog
                 {
-                    Filter = "Kopia zapasowa Wyłącznik czasowy|*.dat",
-                    FileName = $"Wyłącznik czasowy_backup_{DateTime.Now:yyyyMMdd_HHmm}.dat",
-                    Title = "Zapisz kopię zapasową"
+                    Filter = Lang.T("dlg.backupFilter"),
+                    FileName = $"TimerSys_backup_{DateTime.Now:yyyyMMdd_HHmm}.dat",
+                    Title = Lang.T("dlg.backupSaveTitle")
                 };
                 if (sfd.ShowDialog() != DialogResult.OK) return;
                 try
@@ -2043,44 +2162,52 @@
                         string src = Path.Combine(dataDir, fn);
                         if (File.Exists(src)) zip.CreateEntryFromFile(src, fn);
                     }
-                    MessageBox.Show("Kopia zapasowa zapisana pomyślnie.", "Sukces",
+                    MessageBox.Show(Lang.T("dlg.backupOk"), Lang.T("dlg.success"),
                         MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
                 catch (Exception ex)
                 {
-                    MessageBox.Show($"Błąd tworzenia kopii:\n{ex.Message}", "Błąd",
+                    MessageBox.Show(Lang.T("dlg.backupFail", ex.Message), Lang.T("msg.error"),
                         MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
             };
+            SetIcon(btnBackup, Ico.Save);
             dlg.Controls.Add(btnBackup);
 
             var btnRestore = new System.Windows.Forms.Button
             {
-                Text = "📂 Przywróć z kopii...",
+                Text = Lang.T("dlg.backupRestore"),
                 Location = new Point(224, 58), Size = new Size(200, 36), FlatStyle = FlatStyle.Flat
             };
             btnRestore.Click += (s, ev) =>
             {
                 using var ofd = new OpenFileDialog
                 {
-                    Filter = "Kopia zapasowa Wyłącznik czasowy|*.dat|Wszystkie pliki|*.*",
-                    Title = "Wybierz plik kopii zapasowej"
+                    Filter = Lang.T("dlg.backupFilterOpen"),
+                    Title = Lang.T("dlg.backupOpenTitle")
                 };
                 if (ofd.ShowDialog() != DialogResult.OK) return;
-                if (MessageBox.Show("To zastąpi bieżącą konfigurację i zamknie program.\nKontynuować?",
-                    "Potwierdzenie", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+                if (MessageBox.Show(Lang.T("dlg.restoreWarn"),
+                    Lang.T("dlg.confirm"), MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
                 try
                 {
                     string dataDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data");
+                    Directory.CreateDirectory(dataDir);
+                    string dataRoot = Path.GetFullPath(dataDir + Path.DirectorySeparatorChar);
                     using var zip = new ZipArchive(File.OpenRead(ofd.FileName), ZipArchiveMode.Read);
                     foreach (var entry in zip.Entries)
                     {
-                        string dest = Path.Combine(dataDir, entry.FullName);
-                        if (!string.IsNullOrEmpty(Path.GetFileName(dest)))
-                            entry.ExtractToFile(dest, true);
+                        if (string.IsNullOrEmpty(Path.GetFileName(entry.FullName))) continue;
+
+                        string dest = Path.GetFullPath(Path.Combine(dataRoot, entry.FullName));
+                        if (!dest.StartsWith(dataRoot, StringComparison.OrdinalIgnoreCase)) continue;
+
+                        string? destDir = Path.GetDirectoryName(dest);
+                        if (!string.IsNullOrEmpty(destDir)) Directory.CreateDirectory(destDir);
+                        entry.ExtractToFile(dest, true);
                     }
-                    MessageBox.Show("Przywracanie zakończone. Program zostanie zamknięty i uruchomiony ponownie.",
-                        "Sukces", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    MessageBox.Show(Lang.T("dlg.restoreOk"),
+                        Lang.T("dlg.success"), MessageBoxButtons.OK, MessageBoxIcon.Information);
 
                     int pid2 = Environment.ProcessId;
                     string exePath = Application.ExecutablePath;
@@ -2096,15 +2223,16 @@
                 }
                 catch (Exception ex)
                 {
-                    MessageBox.Show($"Błąd przywracania:\n{ex.Message}", "Błąd",
+                    MessageBox.Show(Lang.T("dlg.restoreFail", ex.Message), Lang.T("msg.error"),
                         MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
             };
+            SetIcon(btnRestore, Ico.FolderOpen);
             dlg.Controls.Add(btnRestore);
 
             var btnClose = new System.Windows.Forms.Button
             {
-                Text = "Zamknij", Location = new Point(175, 150), Size = new Size(90, 28),
+                Text = Lang.T("dlg.close"), Location = new Point(175, 150), Size = new Size(90, 28),
                 FlatStyle = FlatStyle.Flat, DialogResult = DialogResult.Cancel
             };
             dlg.Controls.Add(btnClose);
@@ -2115,210 +2243,65 @@
             dlg.ShowDialog(this);
         }
 
-
         private void ShowHelpDialog()
         {
-            bool dark = appSettings["darkModeEnabled"] == "1";
-            Color bg = dark ? Color.FromArgb(25, 25, 28) : Color.FromArgb(250, 250, 252);
-            Color fg = dark ? Color.FromArgb(210, 210, 210) : Color.FromArgb(40, 40, 40);
-
-            var dlg = new Form
-            {
-                Text = "Dokumentacja Systemowa – Wyłącznik Czasowy",
-                ClientSize = new Size(750, 600),
-                FormBorderStyle = FormBorderStyle.FixedDialog,
-                StartPosition = FormStartPosition.CenterParent,
-                MaximizeBox = false,
-                MinimizeBox = false,
-                BackColor = bg
-            };
-
-            var rtb = new RichTextBox
-            {
-                Location = new Point(10, 10),
-                Size = new Size(730, 530),
-                ReadOnly = true,
-                BorderStyle = BorderStyle.None,
-                BackColor = bg,
-                ForeColor = fg,
-                ScrollBars = RichTextBoxScrollBars.Vertical,
-                Font = new Font("Segoe UI", 10f),
-                // Ustawiamy marginesy w sposób bezpieczny dla .NET
-                SelectionIndent = 15,
-                SelectionRightIndent = 15
-            };
-            dlg.Controls.Add(rtb);
-
-            // --- Metody formatowania tekstu ---
-            void AddHeader(string text, Color color)
-            {
-                rtb.SelectionStart = rtb.TextLength;
-                rtb.SelectionFont = new Font("Segoe UI", 15f, FontStyle.Bold);
-                rtb.SelectionColor = color;
-                rtb.AppendText(text + "\n");
-            }
-
-            void AddSubHeader(string text)
-            {
-                rtb.SelectionStart = rtb.TextLength;
-                rtb.SelectionFont = new Font("Segoe UI", 11f, FontStyle.Bold);
-                rtb.SelectionColor = dark ? Color.WhiteSmoke : Color.FromArgb(60, 60, 60);
-                rtb.AppendText(text + "\n");
-            }
-
-            void AddParagraph(string text)
-            {
-                rtb.SelectionStart = rtb.TextLength;
-                rtb.SelectionFont = new Font("Segoe UI", 10f, FontStyle.Regular);
-                rtb.SelectionColor = fg;
-                rtb.AppendText(text + "\n");
-            }
-
-            void AddBullet(string text)
-            {
-                rtb.SelectionStart = rtb.TextLength;
-                rtb.SelectionFont = new Font("Segoe UI", 10f, FontStyle.Regular);
-                rtb.SelectionColor = dark ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 100, 100);
-                rtb.AppendText(" • " + text + "\n");
-            }
-
-            void AddSpace() { rtb.AppendText("\n"); }
-
-            // --- KOLORYSTYKA SEKCJI ---
-            Color accent = Color.FromArgb(0, 120, 215); // Windows Blue
-            Color success = Color.FromArgb(40, 167, 69);
-            Color warning = Color.FromArgb(255, 133, 27);
-
-            // --- TREŚĆ DOKUMENTACJI ---
-            AddHeader("Wyłącznik czasowy", accent);
-            AddParagraph("Program Wyłącznik Czasowy to zaawansowane narzędzie do zarządzania stanem komputera, planowania wykonywania działań oraz uruchamiania określonych operacji wywołanych w czasie. ");
-            AddSpace();
-
-            AddHeader("1. Aktywatory", success);
-            AddSubHeader("Aktywator Bezczynności");
-            AddParagraph("System monitoruje aktywność wejściową użytkownika (Input Idle Time).");
-            AddBullet("Wymagany format czasu: HH:MM:SS.");
-            AddBullet("Licznik jest zerowany natychmiast po wykryciu ruchu myszy lub naciśnięciu klawisza. Wykrywany jest więc na wejściu ruch i aktywność użytkownika.");
-            AddBullet("W ustawieniach programu, możesz wymusić automatyczny restart odliczania licznika, gdy operacja zostanie wykonana pomyślnie.");
-            AddSpace();
-
-            AddSubHeader("Aktywator Czasowy (Stoper)");
-            AddParagraph("Umożliwia zaplanowanie jednorazowej operacji na konkretny moment.");
-            AddBullet("Precyzja co do minuty. Program wykona zaplanowaną czynność w przyszłości, którą wybrał użytkownik.");
-            AddBullet("Idealny do planowania zadań na konkretną godzinę.");
-            AddSpace();
-
-            AddSubHeader("Aktywator harmonogramu");
-            AddParagraph("Powtarzalność wykonywanych zadań.");
-            AddBullet("Obsługa wielu wariantów powtarzalności takich jak: (dni robocze, weekendy, interwały).");
-            AddBullet("Tryb interwałowy: Pozwala na powtarzanie akcji co określoną liczbę minut/godzin.");
-            AddBullet("Kolejka harmonogramu zadań- jest jedyną, która pozwala być wstrzymana i wznowiona w dowolnym momencie działania programu.");
-            AddSubHeader("Dostępne opcje działania:");
-            AddBullet("Aby zatrzymać harmonogram lub wznowić jego działanie, kliknij w menu kontekstowym na pasku zadań odpowiednią opcję, lub skorzystaj z opcji przycisku dostępnym w panelu Harmonogramu.");
-            AddBullet("Przycisk włączenia/wyłączenia zadania- zatrzymuje działanie wybranego zadania w harmonogramie lub je wznawia.");
-            AddBullet("Przycisk edycji pozwala na zmianę momentu aktywacji działania aktywatora, pozwala dodać notatkę widoczną dla osoby modyfikującej działanie, pozwala także zmienić opcje aktywatorów.");
-            AddBullet("Przycisk usuwania zadania- całkowicie kasuje z kolejki harmonogramu aktywne zadanie, jednocześnie je zatrzymując.");
-            AddSpace();
-
-            AddHeader("2. Lista możliwych zadań do wykonania przez aktywatory", warning);
-            AddParagraph("Program wspiera kilka natywnych akcji systemowych, oraz kilka własnych rozwiązań, pogrupowanych bezpośrednio w kategoriach opisanych niżej:");
-            AddSubHeader("Zasilanie i Sesja");
-            AddBullet("Zamknięcie systemu / Restart / Uśpienie / Hibernacja.");
-            AddBullet("Blokada stacji roboczej oraz wylogowanie użytkownika.");
-            AddSubHeader("Monitoring i Narzędzia");
-            AddBullet("Uruchom polecenie: Egzekucja własnych skryptów .bat lub plików .exe. Jeśli program jest uruchomiony z uprawieniami Administratora- można wykonać też skrypty wymagające uprawień.");
-            AddBullet("Notatka: Zapisuje komunikat dla użytkownika.");
-            AddSubHeader("Moduł czyszczenia dysku");
-            AddParagraph("To małe narzędzie konserwacyjne, które obejmuje usuwanie zbędnych plików zalegających na dysku systemowym. Pozwala to zaoszczędzić cenne miejsce na dysku.");
-            AddBullet("Cache Windows Update: usuwanie pozostałości po instalacjach łatek.");
-            AddBullet("Miniatury (Thumbcache): naprawianie błędów z ikonami plików.");
-            AddBullet("Dane Prefetch: optymalizacja bazy startowej Windows.");
-            AddBullet("Własne ścieżki: możliwość zdefiniowania dowolnych katalogów do cyklicznego czyszczenia.");
-            AddBullet("Uwaga: niektóre operacje wymagają uprawień administracyjnych, aby móc je wykonać. Upewnij się, czy program jest uruchomiony jako administrator, aby móc wykonać wszystkie operacje czyszczenia plików tymczasowych.");
-            AddSubHeader("Moduł zrzutów ekranu:");
-            AddParagraph("Aplikacja posiada wbudowany funkcję do wykonywania zrzutów ekranu, która może pełnić zadanie monitoringu pracy lub archiwizacji stanu pulpitu przed zamknięciem systemu.");
-            AddBullet("Format zapisu: Natywna obsługa formatów bezstratnych (PNG) oraz kompresowanych (JPG).");
-            AddBullet("Serie (Burst Mode): Możliwość wykonania określonej liczby zdjęć (np. 10) w zadanym interwale milisekundowym.");
-            AddBullet("Archiwizacja: Automatyczne tworzenie unikalnych nazw plików z sygnaturą czasową i możliwość zapisu w dedykowanym folderze lub na pulpicie.");
-            AddSubHeader("Otwórz stronę internetową:");
-            AddParagraph("Moduł ten umożliwia otworzenie w domyślnej przeglądarce wskazanej strony internetowej.");
-            AddSubHeader("Otwórz dzwięk:");
-            AddParagraph("Opcja uruchamia wskazany przez użytkownika plik dzwiękowy, z folderu /sounds dostępnym w katalogu aplikacji lub wskazanej ścieżki przez użytkownika. Jeśli nic nie zostanie znalezione oraz ustawione- program uruchomi domyślny plik dzwiekowy z folderu systemowego.");
-            AddSpace();
-
-            AddHeader("4. Blokada dostępu do interfejsu programu", Color.FromArgb(200, 0, 0));
-            AddSubHeader("Ochrona Hasłem");
-            AddParagraph("Program posiada wbudowany system autoryzacji blokujący dostęp do krytycznych ustawień.");
-            AddBullet("Domyślne hasło: 123456. Ponieważ jest to domyślne hasło, oraz dosyć łatwe do odgadnięcia hasło- zalecane jest zaraz po aktywowaniu tej opcji - zmienienie hasła na inne.");
-            AddBullet("Blokada GUI uniemożliwi wtedy niepowołanym użytkownikom systemu Windows na zmianę ustawień programu lub całkowitą dezaktywację jego działania.");
-            AddSpace();
-
-            AddHeader("5. Kontakt/wsparcie", Color.Gray);
-            AddBullet("Jeśli masz problemy z tym programem, znalazłeś bugi lub masz sugestie, skontaktuj się z nami. Możesz nam pomóc rozwiązać problem, poprzez opisanie go w wątku 'Issues' na GitHub, pod tym linkiem: https://github.com/Mattronix7200/TimerSysApp/issues. Z góry dziękujemy!");
-            AddBullet("Program ci się spodobał. Rozważ wspracie finansowe autorów programu. Link do przekazania wspracia znajdziesz tutaj: https://suppi.pl/jmichalski");
-            // Powrót na górę dokumentu
-            rtb.SelectionStart = 0;
-            rtb.ScrollToCaret();
-
-            var btnClose = new System.Windows.Forms.Button
-            {
-                Text = "OK",
-                Dock = DockStyle.Bottom,
-                Height = 45,
-                FlatStyle = FlatStyle.Flat,
-                BackColor = dark ? Color.FromArgb(45, 45, 48) : Color.FromArgb(220, 220, 220),
-                ForeColor = fg,
-                Cursor = Cursors.Hand
-            };
-            btnClose.FlatAppearance.BorderSize = 0;
-            btnClose.Click += (s, e) => dlg.Close();
-
-            dlg.Controls.Add(btnClose);
-            dlg.ShowDialog(this);
+            if (HelpFile.Open()) return;
+            MessageBox.Show(Lang.T("help.missing"), Lang.T("msg.error"),
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
-        private void Form1_Load(object sender, EventArgs e)
+        private void Form1_Load(object? sender, EventArgs e)
         {
             ContextMenuStrip menu = new ContextMenuStrip();
-            menu.Items.Add(new ToolStripMenuItem("Zamknij program", null, (s, ev) =>
+            _menuExit = new ToolStripMenuItem(Lang.T("tray.exit"), null, (s, ev) =>
             {
-                Application.ExitThread();
-            }));
-            menu.Items.Add(new ToolStripMenuItem("Zatrzymaj odliczanie (bezczynność)", null, (s, ev) =>
+
+                _forceExit = true;
+                Close();
+            });
+            _menuStopIdle = new ToolStripMenuItem(Lang.T("tray.stopIdle"), null, (s, ev) =>
             {
                 timer1.Stop();
-            }));
-            menu.Items.Add(new ToolStripMenuItem("Zatrzymaj odliczanie (czasowe)", null, (s, ev) =>
+                _lastSecond1 = -1;
+                textBox5.Text = "";
+            });
+            _menuStopTimer = new ToolStripMenuItem(Lang.T("tray.stopTimer"), null, (s, ev) =>
             {
                 timer2.Stop();
-            }));
-            menu.Items.Add(new ToolStripMenuItem("Wznów odliczanie (bezczynność)", null, (s, ev) =>
+                _lastSecond2 = -1;
+                textBox9.Text = "";
+            });
+            _menuResumeIdle = new ToolStripMenuItem(Lang.T("tray.resumeIdle"), null, (s, ev) =>
             {
-                if (TimeSpan.TryParse(textBox4.Text, out var ts4m))
+                if (TryParseTime(textBox4.Text, out var ts4m))
                     timer1EndTime = DateTime.Now.Add(ts4m);
                 timer1.Start();
-            }));
-            menu.Items.Add(new ToolStripMenuItem("Wznów odliczanie (czasowe)", null, (s, ev) =>
+            });
+            _menuResumeTimer = new ToolStripMenuItem(Lang.T("tray.resumeTimer"), null, (s, ev) =>
             {
-                DateTime selectedDate = dateTimePicker1.Value.Date;
-                TimeSpan selectedTime = TimeSpan.Parse(textBox7.Text);
-                DateTime fullSelectedDateTime = selectedDate + selectedTime;
+
+                if (!TryGetTimerTarget(out DateTime fullSelectedDateTime, out _)) return;
 
                 TimeSpan timeToWait = fullSelectedDateTime - DateTime.Now;
                 if (timeToWait.TotalSeconds > 0)
                 {
+                    _timer2LocalTarget = fullSelectedDateTime;
                     timer2EndTime = DateTime.UtcNow.Add(timeToWait);
                     timer2.Start();
                 }
-            }));
-            menu.Items[0].Image = File.Exists(Path.Combine(appDirectory, "icons", "close.ico")) ? Image.FromFile(Path.Combine(appDirectory, "icons", "close.ico")) : null;
-            menu.Items[3].Image = File.Exists(Path.Combine(appDirectory, "icons", "next.ico")) ? Image.FromFile(Path.Combine(appDirectory, "icons", "next.ico")) : null;
-            menu.Items[4].Image = File.Exists(Path.Combine(appDirectory, "icons", "next.ico")) ? Image.FromFile(Path.Combine(appDirectory, "icons", "next.ico")) : null;
-            menu.Items[1].Image = File.Exists(Path.Combine(appDirectory, "icons", "stop.ico")) ? Image.FromFile(Path.Combine(appDirectory, "icons", "stop.ico")) : null;
-            menu.Items[2].Image = File.Exists(Path.Combine(appDirectory, "icons", "stop.ico")) ? Image.FromFile(Path.Combine(appDirectory, "icons", "stop.ico")) : null;
-            menu.Items[1].Enabled = !timer1.Enabled;
-            notifyIcon1.ContextMenuStrip = menu;
+            });
+            menu.Items.AddRange(new ToolStripItem[]
+            {
+                _menuExit, _menuStopIdle, _menuStopTimer, _menuResumeIdle, _menuResumeTimer
+            });
 
+            var menuIconColor = Color.FromArgb(70, 70, 74);
+            _menuExit.Image        = VectorIcons.Get(Ico.Close, 16, menuIconColor);
+            _menuStopIdle.Image    = VectorIcons.Get(Ico.Stop,  16, menuIconColor);
+            _menuStopTimer.Image   = VectorIcons.Get(Ico.Stop,  16, menuIconColor);
+            _menuResumeIdle.Image  = VectorIcons.Get(Ico.Play,  16, menuIconColor);
+            _menuResumeTimer.Image = VectorIcons.Get(Ico.Play,  16, menuIconColor);
+            notifyIcon1.ContextMenuStrip = menu;
 
             label19.Location = new Point(0, 0);
             label19.Size = new Size(this.ClientSize.Width, this.ClientSize.Height);
@@ -2328,27 +2311,12 @@
             label19.Click += label19_Click;
             label19.Cursor = Cursors.Hand;
 
-            if (checkBox6.Checked)
-            {
-                tabControl1.TabPages["tabPage1"].Enabled = false;
-                tabControl1.TabPages["tabPage2"].Enabled = false;
-                tabControl1.TabPages["tabPage3"].Enabled = false;
-                button6.Enabled = false;
-                label19.Visible = true;
-                label19.Enabled = true;
-            }
-            else
-            {
-
-                label19.Visible = false;
-                label19.Enabled = false;
-            }
-
+            SetUiLocked(checkBox6.Checked);
 
             textBoxUser.Width = 511;
             var btnBrowse = new System.Windows.Forms.Button
             {
-                Text = "📂",
+                Text = "",
                 Width = 30,
                 Height = textBoxUser.Height,
                 Location = new Point(textBoxUser.Right + 4, textBoxUser.Top),
@@ -2356,7 +2324,8 @@
                 TabIndex = 100
             };
             var ttip = new System.Windows.Forms.ToolTip();
-            ttip.SetToolTip(btnBrowse, "Przeglądaj plik (exe, bat, ps1, cmd, vbs)");
+            _disposables.Add(ttip);
+            RegTip(ttip, btnBrowse, "tip.browseFile");
             btnBrowse.Click += (s, ev) =>
             {
                 using var dlg = new OpenFileDialog
@@ -2369,31 +2338,37 @@
             groupBox1.Controls.Add(btnBrowse);
 
             var presetMenu = new ContextMenuStrip();
-            presetMenu.Items.Add("Notatnik", null, (s, ev) => textBoxUser.Text = "notepad.exe");
-            presetMenu.Items.Add("Kalkulator", null, (s, ev) => textBoxUser.Text = "calc.exe");
-            presetMenu.Items.Add("Menedżer zadań", null, (s, ev) => textBoxUser.Text = "taskmgr.exe");
-            presetMenu.Items.Add("Eksplorator plików", null, (s, ev) => textBoxUser.Text = "explorer.exe");
-            presetMenu.Items.Add("Wiersz poleceń", null, (s, ev) => textBoxUser.Text = "cmd.exe /k");
-            presetMenu.Items.Add("PowerShell", null, (s, ev) => textBoxUser.Text = "powershell.exe");
+            var presetCommands = new[] { "notepad.exe", "calc.exe", "taskmgr.exe", "explorer.exe", "cmd.exe /k", "powershell.exe" };
+            presetMenu.Opening += (s, ev) =>
+            {
+                presetMenu.Items.Clear();
+                var names = Lang.A("presets");
+                for (int i = 0; i < presetCommands.Length && i < names.Length; i++)
+                {
+                    string cmd = presetCommands[i];
+                    presetMenu.Items.Add(names[i], null, (s2, ev2) => textBoxUser.Text = cmd);
+                }
+            };
             var btnPreset = new System.Windows.Forms.Button
             {
-                Text = "▼",
+                Text = "",
                 Width = 28,
                 Height = textBoxUser.Height,
                 Location = new Point(btnBrowse.Right + 2, textBoxUser.Top),
                 FlatStyle = FlatStyle.Flat,
                 TabIndex = 101
             };
-            ttip.SetToolTip(btnPreset, "Wybierz gotowe polecenie z listy");
+            RegTip(ttip, btnPreset, "tip.presets");
             btnPreset.Click += (s, ev) => presetMenu.Show(btnPreset, new Point(0, btnPreset.Height));
             groupBox1.Controls.Add(btnPreset);
-
+            RegIcon(btnBrowse, Ico.Folder, 16);
+            RegIcon(btnPreset, Ico.ChevronDown, 14);
 
             _lblScheduleStatus = new System.Windows.Forms.Label
             {
                 Name = "lblScheduleStatus",
                 Text = "Harmonogram nieaktywny",
-                Location = new Point(20, 350),
+                Location = new Point(20, 336),
                 Size = new Size(620, 18),
                 Font = new Font("Segoe UI", 9f, FontStyle.Regular),
                 ForeColor = Color.DimGray,
@@ -2402,44 +2377,40 @@
             tabPage6.Controls.Add(_lblScheduleStatus);
             _lblScheduleStatus.BringToFront();
 
-
-            var sepLine = new System.Windows.Forms.Label
+            var sepLine = _sepSnooze = new System.Windows.Forms.Label
             {
                 BorderStyle = BorderStyle.Fixed3D,
-                Location = new Point(20, 372),
+                Location = new Point(20, 360),
                 Size = new Size(620, 2),
                 AutoSize = false
             };
             tabPage6.Controls.Add(sepLine);
 
-
-            var lblSnoozeHeader = new System.Windows.Forms.Label
+            var lblSnoozeHeader = _lblSnoozeHeader = new System.Windows.Forms.Label
             {
-                Text = "⏰  Jednorazowe powtórzenie akcji za:",
-                Location = new Point(20, 378),
-                Size = new Size(260, 17),
+                Text = Lang.T("snooze.header"),
+                Location = new Point(20, 368),
+                Size = new Size(300, 17),
                 Font = new Font("Segoe UI", 9f, FontStyle.Bold),
                 AutoSize = false
             };
             tabPage6.Controls.Add(lblSnoozeHeader);
 
-            var cboSnooze = new System.Windows.Forms.ComboBox
+            var cboSnooze = _cboSnooze = new System.Windows.Forms.ComboBox
             {
-                Location = new Point(20, 398),
+                Location = new Point(20, 390),
                 Size = new Size(130, 25),
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 FlatStyle = FlatStyle.Flat
             };
-            cboSnooze.Items.AddRange(new object[] {
-                "5 minut", "10 minut", "30 minut",
-                "1 godzina", "3 godziny", "5 godzin", "10 godzin" });
+            cboSnooze.Items.AddRange(Lang.A("snoozeItems"));
             cboSnooze.SelectedIndex = 0;
             tabPage6.Controls.Add(cboSnooze);
 
-            var btnSnooze = new System.Windows.Forms.Button
+            var btnSnooze = _btnSnooze = new System.Windows.Forms.Button
             {
-                Text = "▶ Uruchom",
-                Location = new Point(156, 397),
+                Text = Lang.T("snooze.run"),
+                Location = new Point(156, 389),
                 Size = new Size(95, 26),
                 FlatStyle = FlatStyle.Flat
             };
@@ -2448,13 +2419,12 @@
             _lblSnoozeStatus = new System.Windows.Forms.Label
             {
                 Text = "",
-                Location = new Point(256, 401),
-                Size = new Size(200, 18),
+                Location = new Point(262, 394),
+                Size = new Size(300, 18),
                 ForeColor = Color.Coral,
                 AutoSize = false
             };
             tabPage6.Controls.Add(_lblSnoozeStatus);
-
 
             _timerSnooze.Tick += (s, ev) =>
             {
@@ -2464,23 +2434,29 @@
                     _timerSnooze.Stop();
                     btnSnooze.Enabled = true;
                     _lblSnoozeStatus.Text = "";
-                    if (comboBox3.SelectedItem != null)
-                        ExecuteCommand(comboBox3.SelectedItem.ToString(), 3);
+                    if (comboBox3.SelectedIndex >= 0)
+                        ExecuteCommand(ActionIdFromIndex(comboBox3.SelectedIndex), 3);
                 }
                 else
                 {
-                    _lblSnoozeStatus.Text = $"Odlicza: {rem:mm\\:ss}";
+                    _lblSnoozeStatus.Text = Lang.T("snooze.counting", rem.ToString(@"mm\:ss"));
                 }
             };
             btnSnooze.Click += (s, ev) =>
             {
                 int[] minutes = { 5, 10, 30, 60, 180, 300, 600 };
-                int delay = minutes[cboSnooze.SelectedIndex];
-                _snoozeEndTime = DateTime.Now.AddMinutes(delay);
+                int idx = cboSnooze.SelectedIndex;
+                if (idx < 0 || idx >= minutes.Length) return;
+                if (comboBox3.SelectedIndex < 0)
+                {
+                    MessageBox.Show(Lang.T("snooze.pickAction"),
+                        Lang.T("msg.title"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+                _snoozeEndTime = DateTime.Now.AddMinutes(minutes[idx]);
                 _timerSnooze.Start();
                 btnSnooze.Enabled = false;
             };
-
 
             int settingsBtnX = comboBox1.Right + 5;
             int settingsBtnY = comboBox1.Top;
@@ -2493,7 +2469,7 @@
                 FlatStyle = FlatStyle.Flat,
                 TabStop = false
             };
-            _actionTip.SetToolTip(_btnActSettings1, "Ustawienia wybranej akcji");
+            RegTip(_actionTip, _btnActSettings1, "tip.actionSettings");
             _btnActSettings1.Click += (s, ev) => ShowActionSettingsDialog(comboBox1, 1);
             _btnActSettings1.Enabled = ActionHasParams(comboBox1.SelectedIndex);
             tabPage1.Controls.Add(_btnActSettings1);
@@ -2506,7 +2482,7 @@
                 FlatStyle = FlatStyle.Flat,
                 TabStop = false
             };
-            _actionTip.SetToolTip(_btnActSettings2, "Ustawienia wybranej akcji");
+            RegTip(_actionTip, _btnActSettings2, "tip.actionSettings");
             _btnActSettings2.Click += (s, ev) => ShowActionSettingsDialog(comboBox2, 2);
             _btnActSettings2.Enabled = ActionHasParams(comboBox2.SelectedIndex);
             tabPage2.Controls.Add(_btnActSettings2);
@@ -2519,34 +2495,38 @@
                 FlatStyle = FlatStyle.Flat,
                 TabStop = false
             };
-            _actionTip.SetToolTip(_btnActSettings3, "Ustawienia wybranej akcji");
+            RegTip(_actionTip, _btnActSettings3, "tip.actionSettings");
             _btnActSettings3.Click += (s, ev) => ShowActionSettingsDialog(comboBox3, 3);
             _btnActSettings3.Enabled = ActionHasParams(comboBox3.SelectedIndex);
             tabPage6.Controls.Add(_btnActSettings3);
 
-
             var settTip = new System.Windows.Forms.ToolTip();
-            settTip.SetToolTip(checkBox1, "Tworzy skrót w folderze autostartu systemu Windows,\ntak aby program uruchamiał się razem z systemem.");
-            settTip.SetToolTip(checkBox2, "Automatycznie uruchamia odliczanie aktywatora bezczynności\nzaraz po otwarciu programu.");
-            settTip.SetToolTip(checkBox3, "Minimalizacja okna chowa program do zasobnika (ikony tray)\nzamiast na pasek zadań. Podwójne kliknięcie ikony przywraca okno.");
-            settTip.SetToolTip(checkBox4, "Licznik bezczynności jest resetowany przy każdej aktywności użytkownika\ni ponownie uruchamiany – akcja wykona się po czasie CIĄGŁEJ bezczynności.");
-            settTip.SetToolTip(checkBox5, "Importuje specjalny plan zasilania\ni utrzymuje go aktywnym – zapobiega automatycznemu usypianiu przez Windows.");
-            settTip.SetToolTip(checkBox6, "Blokuje dostęp do ustawień programu hasłem.\nDomyślne hasło (jeśli niezmienione) to: 123456");
-            settTip.SetToolTip(checkBox7, "Jeśli włączone – program poczeka na zakończenie uruchamianego procesu\nzanim przejdzie dalej (tryb synchroniczny).");
-            settTip.SetToolTip(checkBox8, "Uwzględnia zmiany czasu systemowego \nprzy obliczaniu czasu do akcji w aktywatorze czasowym. Opcja ta nie wpływa na zmianę czasu w danej strefie.");
-            settTip.SetToolTip(checkBox9, "Ukrywa ikonę programu z paska zadań (zasobnik systemowy).\nProgram nadal działa w tle.");
-            settTip.SetToolTip(checkBox10, "Ukrywa wyświetlanie licznika odliczania na ekranie.\nProgram nadal odlicza i wykona akcję o wyznaczonym czasie.");
-            settTip.SetToolTip(checkBox11, "Przełącza wygląd programu na ciemny motyw\n(ciemne tło, jasny tekst).");
-
+            _disposables.Add(settTip);
+            RegTip(settTip, checkBox1,  "tip.autoStartWindows");
+            RegTip(settTip, checkBox2,  "tip.autoCountdown");
+            RegTip(settTip, checkBox3,  "tip.minimizeToTray");
+            RegTip(settTip, checkBox4,  "tip.resetCounter");
+            RegTip(settTip, checkBox5,  "tip.noSleep");
+            RegTip(settTip, checkBox6,  "tip.passwordLock");
+            RegTip(settTip, checkBox7,  "tip.waitForProcess");
+            RegTip(settTip, checkBox8,  "tip.timezone");
+            RegTip(settTip, checkBox9,  "tip.noTray");
+            RegTip(settTip, checkBox10, "tip.noCountdown");
+            RegTip(settTip, checkBox11, "tip.darkMode");
 
             _timerStatusUI.Tick += (s, ev) =>
             {
                 if (_lblScheduleStatus != null)
                 {
+
+                    bool darkUi    = checkBox11.Checked;
+                    Color idleCol   = darkUi ? Color.FromArgb(150, 150, 150) : Color.DimGray;
+                    Color activeCol = darkUi ? Color.FromArgb(110, 215, 130) : Color.DarkGreen;
+
                     if (!timer3.Enabled)
                     {
-                        _lblScheduleStatus.Text = "Harmonogram nieaktywny";
-                        _lblScheduleStatus.ForeColor = Color.DimGray;
+                        _lblScheduleStatus.Text = Lang.T("sched.inactive");
+                        _lblScheduleStatus.ForeColor = idleCol;
                     }
                     else
                     {
@@ -2557,13 +2537,13 @@
                             string ds = diff.TotalHours >= 24
                                 ? $"{(int)diff.TotalDays}d {diff.Hours:D2}h {diff.Minutes:D2}m"
                                 : $"{(int)diff.TotalHours:D2}h {diff.Minutes:D2}m {diff.Seconds:D2}s";
-                            _lblScheduleStatus.Text = $"⏱ Następne uruchomienie: {nextFire.Value:HH:mm} (za {ds})";
-                            _lblScheduleStatus.ForeColor = Color.DarkGreen;
+                            _lblScheduleStatus.Text = Lang.T("sched.next", nextFire.Value.ToString("HH:mm"), ds);
+                            _lblScheduleStatus.ForeColor = activeCol;
                         }
                         else
                         {
-                            _lblScheduleStatus.Text = "Harmonogram aktywny – brak terminu w ciągu 8 dni";
-                            _lblScheduleStatus.ForeColor = Color.DimGray;
+                            _lblScheduleStatus.Text = Lang.T("sched.noDate");
+                            _lblScheduleStatus.ForeColor = idleCol;
                         }
                     }
                 }
@@ -2579,8 +2559,23 @@
                             {
                                 var rem = t.EndTimeUtc - utcNow;
                                 row.Cells[1].Value = rem.TotalSeconds > 0
-                                    ? rem.ToString(@"hh\:mm\:ss")
-                                    : "Wygasło";
+                                    ? FormatRemaining(rem)
+                                    : Lang.T("val.expired");
+                            }
+                            else if (t != null && t.ActivatorType == 1 && t.Enabled)
+                            {
+                                var th = IdleThresholdFor(t);
+                                if (th == null || !timer1.Enabled)
+                                {
+                                    row.Cells[1].Value = Lang.T("val.waiting");
+                                }
+                                else
+                                {
+                                    var left = th.Value - TimeSpan.FromMilliseconds(GetIdleMilliseconds());
+                                    row.Cells[1].Value = left.TotalSeconds > 0
+                                        ? FormatRemaining(left)
+                                        : Lang.T("val.soon");
+                                }
                             }
                             else if (t != null && t.ActivatorType == 3 && t.Enabled
                                      && !string.IsNullOrEmpty(t.RepeatIntervalType))
@@ -2589,16 +2584,15 @@
                                 { "h" => t.RepeatIntervalValue * 60.0, "d" => t.RepeatIntervalValue * 1440.0, _ => t.RepeatIntervalValue };
                                 var nextFire = t.LastFired.AddMinutes(iMin);
                                 var rem = nextFire - DateTime.Now;
-                                string unitLabel = t.RepeatIntervalType switch { "h" => "godz", "d" => "dni", _ => "min" };
-                                row.Cells[1].Value = $"co {t.RepeatIntervalValue} {unitLabel}: "
-                                    + (rem.TotalSeconds > 0 ? rem.ToString(@"hh\:mm\:ss") : "Zaraz...");
+                                string unitLabel = Lang.T(t.RepeatIntervalType switch { "h" => "unit.hour", "d" => "unit.day", _ => "unit.min" });
+                                row.Cells[1].Value = Lang.T("val.every", t.RepeatIntervalValue, unitLabel) + ": "
+                                    + (rem.TotalSeconds > 0 ? FormatRemaining(rem) : Lang.T("val.soon"));
                             }
                         }
                     }
                 }
             };
             _timerStatusUI.Start();
-
 
             UpdateComboHints(comboBox1, tip01, _btnActSettings1);
             UpdateComboHints(comboBox2, tip02, _btnActSettings2);
@@ -2607,8 +2601,7 @@
             stopStartHarmonogram.Click += (s, ev) => SetHarmonogramRunning(appSettings["timer3UserPaused"] == "1");
             ApplyHarmonogramUI(appSettings["timer3UserPaused"] != "1");
 
-            this.FormClosed += (s, ev) => StopSound();
-
+            this.FormClosed += (s, ev) => CleanupResources();
 
             if (checkBox8.Checked)
                 SystemEvents.TimeChanged += SystemEvents_TimeChanged;
@@ -2622,15 +2615,12 @@
             if (checkBox11.Checked)
                 ApplyTheme(true);
 
-
             checkBox12.CheckedChanged += (s, ev) =>
             {
                 appSettings["autoStartQueue"] = checkBox12.Checked ? "1" : "0";
                 SaveConfigFile();
             };
-            settTip.SetToolTip(checkBox12,
-                "Po uruchomieniu programu automatycznie wznawia timer dla zadań\ndodanych do kolejki Harmonogram (nie wymaga ręcznego ponownego dodawania).");
-
+            RegTip(settTip, checkBox12, "tip.autoQueue");
 
             checkBox16.Checked = appSettings["noBalloon"] == "1";
             checkBox16.CheckedChanged += (s, ev) =>
@@ -2638,12 +2628,12 @@
                 appSettings["noBalloon"] = checkBox16.Checked ? "1" : "0";
                 SaveConfigFile();
             };
-            settTip.SetToolTip(checkBox16, "Wyłącza dymki informacyjne pojawiające się nad paskiem zadań\ngdy aktywator wykonuje wybraną akcję.");
-
+            RegTip(settTip, checkBox16, "tip.noBalloon");
 
             string adminFlagPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data", "runasadmin.flag");
             checkBox15.Checked = File.Exists(adminFlagPath);
-            if (IsAdmin()) { checkBox15.Text = "✓ " + checkBox15.Text; checkBox15.ForeColor = Color.DarkGreen; }
+
+            if (IsAdmin()) checkBox15.ForeColor = Color.FromArgb(0, 128, 0);
             checkBox15.CheckedChanged += (s, ev) =>
             {
                 if (checkBox15.Checked)
@@ -2653,8 +2643,8 @@
                     if (!IsAdmin())
                     {
                         var res = MessageBox.Show(
-                            "Opcja zostanie zastosowana przy następnym uruchomieniu.\nUruchomić teraz jako administrator?",
-                            "Uprawnienia administratora", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                            Lang.T("dlg.runAsAdminTip"),
+                            Lang.T("dlg.runAsAdminNow"), MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                         if (res == DialogResult.Yes)
                         {
                             try
@@ -2675,79 +2665,69 @@
                 }
                 else { if (File.Exists(adminFlagPath)) File.Delete(adminFlagPath); }
             };
-            settTip.SetToolTip(checkBox15, IsAdmin()
-                ? "Program działa już z uprawnieniami administratora."
-                : "Przy każdym uruchomieniu programu zostanie wyświetlony monit UAC\no podwyższenie uprawnień do poziomu administratora.");
-
+            RegTip(settTip, checkBox15, IsAdmin() ? "tip.runAsAdminOn" : "tip.runAsAdminOff");
 
             menu.Items.Add(new ToolStripSeparator());
+            bool schedPaused = appSettings["timer3UserPaused"] == "1";
             _menuScheduleToggle = new ToolStripMenuItem(
-                appSettings["timer3UserPaused"] == "1" ? "▶ Uruchom harmonogram" : "⏸ Zatrzymaj harmonogram",
-                null, ToggleScheduleFromTray);
+                Lang.T(schedPaused ? "sched.start" : "sched.stop"), null, ToggleScheduleFromTray)
+            {
+                Image = VectorIcons.Get(schedPaused ? Ico.Play : Ico.Stop, 16, menuIconColor)
+            };
             _menuScheduleToggle.Enabled = _taskList.Any(t => t.ActivatorType == 3);
             menu.Items.Add(_menuScheduleToggle);
-            menu.Items.Add(new ToolStripMenuItem("⚙️ Ustawienia", null, (s, ev) =>
+            _menuSettings = new ToolStripMenuItem(Lang.T("tray.settings"), null, (s, ev) =>
             {
                 this.Show();
                 this.WindowState = FormWindowState.Normal;
                 notifyIcon1.Visible = false;
-                tabControl1.SelectedTab = tabControl1.TabPages["tabPage3"];
-            }));
+                var page = tabControl1.TabPages["tabPage3"];
+                if (page != null) tabControl1.SelectedTab = page;
+            })
+            {
+                Image = VectorIcons.Get(Ico.Settings, 16, menuIconColor)
+            };
+            menu.Items.Add(_menuSettings);
 
             menu.Opening += (s, ev) =>
             {
+
+                menu.Items[1].Enabled = timer1.Enabled;
+                menu.Items[2].Enabled = timer2.Enabled;
+                menu.Items[3].Enabled = !timer1.Enabled;
+                menu.Items[4].Enabled = !timer2.Enabled;
+
                 if (_menuScheduleToggle != null)
                 {
                     _menuScheduleToggle.Enabled = _taskList.Any(t => t.ActivatorType == 3);
-                    _menuScheduleToggle.Text = appSettings["timer3UserPaused"] == "1"
-                        ? "▶ Uruchom harmonogram"
-                        : "⏸ Zatrzymaj harmonogram";
+                    bool paused = appSettings["timer3UserPaused"] == "1";
+                    _menuScheduleToggle.Text  = Lang.T(paused ? "sched.start" : "sched.stop");
+                    _menuScheduleToggle.Image = VectorIcons.Get(paused ? Ico.Play : Ico.Stop, 16,
+                                                                Color.FromArgb(70, 70, 74));
                 }
             };
-
 
             button2.Click += (s, ev) => AddTaskAndRun(1);
             button4.Click += (s, ev) => AddTaskAndRun(2);
             button8.Click += (s, ev) => AddTaskAndRun(3);
 
-
             helpLink.LinkClicked += (s, ev) => ShowHelpDialog();
 
-
             button13.Click += (s, ev) => ShowBackupRestoreDialog();
-
 
             dataGridView1.ReadOnly = true;
             dataGridView1.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
             dataGridView1.MultiSelect = false;
 
-            label13.Cursor = Cursors.Hand;
-            label14.Cursor = Cursors.Hand;
-            label15.Cursor = Cursors.Hand;
-
-
-            void UpdateFilterLabels()
-            {
-                var boldFont   = new Font("Segoe UI", 9.75f, FontStyle.Bold);
-                var normalFont = new Font("Segoe UI", 9.75f, FontStyle.Regular);
-                label13.Font = _taskListFilter == 1 ? boldFont : normalFont;
-                label14.Font = _taskListFilter == 2 ? boldFont : normalFont;
-                label15.Font = _taskListFilter == 3 ? boldFont : normalFont;
-                var activeColor  = Color.FromArgb(0, 100, 200);
-                var normalColor  = label13.ForeColor;
-                label13.ForeColor = _taskListFilter == 1 ? activeColor : SystemColors.ControlText;
-                label14.ForeColor = _taskListFilter == 2 ? activeColor : SystemColors.ControlText;
-                label15.ForeColor = _taskListFilter == 3 ? activeColor : SystemColors.ControlText;
-            }
-
-            label13.Click += (s, ev) => { _taskListFilter = _taskListFilter == 1 ? 0 : 1; UpdateFilterLabels(); RefreshTaskGrid(); };
-            label14.Click += (s, ev) => { _taskListFilter = _taskListFilter == 2 ? 0 : 2; UpdateFilterLabels(); RefreshTaskGrid(); };
-            label15.Click += (s, ev) => { _taskListFilter = _taskListFilter == 3 ? 0 : 3; UpdateFilterLabels(); RefreshTaskGrid(); };
+            dataGridView1.RowHeadersVisible = false;
+            dataGridView1.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+            dataGridView1.AllowUserToResizeRows = false;
+            dataGridView1.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
 
             button10.Click += (s, ev) =>
             {
                 if (dataGridView1.SelectedRows.Count == 0) return;
-                string id = dataGridView1.SelectedRows[0].Tag as string;
+                string id = dataGridView1.SelectedRows[0].Tag as string ?? "";
                 var removed = _taskList.FirstOrDefault(t => t.Id == id);
                 if (removed == null) return;
                 int removedType = removed.ActivatorType;
@@ -2757,11 +2737,11 @@
                 {
                     case 1:
                         if (!_taskList.Any(t => t.ActivatorType == 1 && t.Enabled))
-                            timer1.Stop();
+                        { timer1.Stop(); _lastSecond1 = -1; textBox5.Text = ""; }
                         break;
                     case 2:
                         if (!_taskList.Any(t => t.ActivatorType == 2 && t.Enabled && t.EndTimeUtc > DateTime.UtcNow))
-                        { timer2.Stop(); textBox9.Text = "00:00:00"; }
+                        { timer2.Stop(); _lastSecond2 = -1; textBox9.Text = ""; }
                         break;
                     case 3:
                         if (!_taskList.Any(t => t.ActivatorType == 3 && t.Enabled))
@@ -2775,10 +2755,12 @@
             button12.Click += (s, ev) =>
             {
                 if (dataGridView1.SelectedRows.Count == 0) return;
-                string id = dataGridView1.SelectedRows[0].Tag as string;
+                string id = dataGridView1.SelectedRows[0].Tag as string ?? "";
                 var task = _taskList.FirstOrDefault(t => t.Id == id);
                 if (task == null) return;
                 task.Enabled = !task.Enabled;
+
+                if (task.Enabled) task.Completed = false;
 
                 if (!task.Enabled)
                 {
@@ -2787,11 +2769,11 @@
                     {
                         case 1:
                             if (!_taskList.Any(t => t.ActivatorType == 1 && t.Enabled && t.Id != task.Id))
-                                timer1.Stop();
+                            { timer1.Stop(); _lastSecond1 = -1; textBox5.Text = ""; }
                             break;
                         case 2:
                             if (!_taskList.Any(t => t.ActivatorType == 2 && t.Enabled && t.Id != task.Id && t.EndTimeUtc > DateTime.UtcNow))
-                            { timer2.Stop(); textBox9.Text = "Wstrzymano"; }
+                            { timer2.Stop(); _lastSecond2 = -1; textBox9.Text = ""; }
                             break;
                         case 3:
                             if (!_taskList.Any(t => t.ActivatorType == 3 && t.Enabled && t.Id != task.Id))
@@ -2805,7 +2787,7 @@
                     switch (task.ActivatorType)
                     {
                         case 1:
-                            if (!timer1.Enabled && TimeSpan.TryParse(textBox4.Text, out var ts4e))
+                            if (!timer1.Enabled && TryParseTime(textBox4.Text, out var ts4e))
                             { timer1EndTime = DateTime.Now.Add(ts4e); timer1.Start(); }
                             break;
                         case 2:
@@ -2832,10 +2814,10 @@
 
                 bool darkDlg = appSettings["darkModeEnabled"] == "1";
                 int dlgH = task.ActivatorType == 3 ? 310 : task.ActivatorType == 2 ? 220 : 195;
-                var editDlg = new Form
+                using var editDlg = new Form
                 {
-                    Text = "Edytuj zadanie",
-                    ClientSize = new Size(420, dlgH),
+                    Text = Lang.T("dlg.editTask"),
+                    ClientSize = new Size(500, dlgH),
                     FormBorderStyle = FormBorderStyle.FixedDialog,
                     StartPosition = FormStartPosition.CenterParent,
                     MaximizeBox = false, MinimizeBox = false,
@@ -2843,22 +2825,28 @@
                 };
 
                 int row = 12;
+
                 void AddEditRow(string lbl, Control ctrl, int h = 23)
                 {
-                    editDlg.Controls.Add(new System.Windows.Forms.Label { Text = lbl, Location = new Point(12, row + 3), AutoSize = true });
-                    ctrl.Location = new Point(130, row); ctrl.Size = new Size(270, h);
+                    editDlg.Controls.Add(new System.Windows.Forms.Label
+                    {
+                        Text     = lbl,
+                        Location = new Point(12, row + 4),
+                        Size     = new Size(178, 17),
+                        AutoSize = false
+                    });
+                    ctrl.Location = new Point(196, row); ctrl.Size = new Size(286, h);
                     editDlg.Controls.Add(ctrl);
                     row += h + 10;
                 }
 
                 var cboEditAction = new System.Windows.Forms.ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
-                foreach (var item in comboBox1.Items) cboEditAction.Items.Add(item);
-                if (cboEditAction.Items.Contains(task.Action)) cboEditAction.SelectedItem = task.Action;
-                else if (cboEditAction.Items.Count > 0) cboEditAction.SelectedIndex = 0;
-                AddEditRow("Akcja:", cboEditAction);
+                cboEditAction.Items.AddRange(Lang.A("actions"));
+                int curIdx = ActionIndexOf(task.Action);
+                cboEditAction.SelectedIndex = curIdx >= 0 ? curIdx : 0;
+                AddEditRow(Lang.T("dlg.editAction"), cboEditAction);
                 var txtNotes = new TextBox { Text = task.Notes };
-                AddEditRow("Notatka:", txtNotes);
-
+                AddEditRow(Lang.T("dlg.editNote"), txtNotes);
 
                 TextBox? txtIdle = null;
                 DateTimePicker? dtpDate = null;
@@ -2871,15 +2859,15 @@
                 if (task.ActivatorType == 1)
                 {
                     txtIdle = new TextBox { Text = string.IsNullOrEmpty(task.IdleTimeout) ? textBox4.Text : task.IdleTimeout };
-                    AddEditRow("Bezczynnosc (HH:MM:SS):", txtIdle);
+                        AddEditRow(Lang.T("dlg.editIdle"), txtIdle);
                 }
                 else if (task.ActivatorType == 2)
                 {
                     dtpDate = new DateTimePicker { Value = task.LocalTarget != default ? task.LocalTarget.Date : DateTime.Today, Format = DateTimePickerFormat.Short };
-                    AddEditRow("Data:", dtpDate);
+                    AddEditRow(Lang.T("dlg.editDate"), dtpDate);
                     string timeStr = task.LocalTarget != default ? task.LocalTarget.ToString("HH:mm") : "";
                     txtTime2 = new TextBox { Text = timeStr };
-                    AddEditRow("Godzina (HH:MM):", txtTime2);
+                    AddEditRow(Lang.T("dlg.editHour"), txtTime2);
                 }
                 else if (task.ActivatorType == 3)
                 {
@@ -2890,24 +2878,24 @@
                         int repVal = task.RepeatIntervalValue > 0 ? task.RepeatIntervalValue : 30;
                         nudRepN = new System.Windows.Forms.NumericUpDown
                         { Minimum = 1, Maximum = 99999, Value = repVal };
-                        AddEditRow("Powtarzaj co (N):", nudRepN);
+                        AddEditRow(Lang.T("dlg.editEveryN"), nudRepN);
 
-
-                        var panelRB = new System.Windows.Forms.Panel { Location = new Point(130, row), Size = new Size(270, 26) };
-                        rbRepMin  = new System.Windows.Forms.RadioButton { Text = "minut",  Location = new Point(0,  4), AutoSize = true, Checked = task.RepeatIntervalType == "m" };
-                        rbRepHour = new System.Windows.Forms.RadioButton { Text = "godzin", Location = new Point(75, 4), AutoSize = true, Checked = task.RepeatIntervalType == "h" };
-                        rbRepDay  = new System.Windows.Forms.RadioButton { Text = "dni",    Location = new Point(155,4), AutoSize = true, Checked = task.RepeatIntervalType == "d" };
+                        var panelRB = new System.Windows.Forms.Panel { Location = new Point(196, row), Size = new Size(286, 26) };
+                        var repUnits = Lang.A("repeatUnits");
+                        rbRepMin  = new System.Windows.Forms.RadioButton { Text = repUnits[0], Location = new Point(0,  4), AutoSize = true, Checked = task.RepeatIntervalType == "m" };
+                        rbRepHour = new System.Windows.Forms.RadioButton { Text = repUnits[1], Location = new Point(85, 4), AutoSize = true, Checked = task.RepeatIntervalType == "h" };
+                        rbRepDay  = new System.Windows.Forms.RadioButton { Text = repUnits[2], Location = new Point(175,4), AutoSize = true, Checked = task.RepeatIntervalType == "d" };
                         if (!rbRepMin.Checked && !rbRepHour.Checked && !rbRepDay.Checked) rbRepMin.Checked = true;
                         panelRB.Controls.Add(rbRepMin); panelRB.Controls.Add(rbRepHour); panelRB.Controls.Add(rbRepDay);
                         editDlg.Controls.Add(panelRB);
-                        editDlg.Controls.Add(new System.Windows.Forms.Label { Text = "Jednostka:", Location = new Point(12, row + 4), AutoSize = true });
+                        editDlg.Controls.Add(new System.Windows.Forms.Label { Text = Lang.T("dlg.editUnit"), Location = new Point(12, row + 4), Size = new Size(178, 17), AutoSize = false });
                         row += 36;
                     }
                     else
                     {
 
                         txtHour3 = new TextBox { Text = string.IsNullOrEmpty(task.ScheduleHour) ? textBox1.Text : task.ScheduleHour };
-                        AddEditRow("Godzina (HH:MM):", txtHour3);
+                        AddEditRow(Lang.T("dlg.editHour"), txtHour3);
                         clbDays3 = new CheckedListBox { CheckOnClick = true };
 
                         for (int i = 0; i < SCHEDULE_INTERVAL_IDX; i++)
@@ -2922,30 +2910,30 @@
                         for (int i = 0; i < clbDays3.Items.Count; i++)
                             clbDays3.SetItemChecked(i, savedDays.Contains(i));
                         int clbH = Math.Min(120, clbDays3.Items.Count * 18 + 4);
-                        AddEditRow("Powtarzanie:", clbDays3, clbH);
+                        AddEditRow(Lang.T("dlg.editDays"), clbDays3, clbH);
                     }
                 }
 
                 row += 4;
                 var btnSave2 = new System.Windows.Forms.Button
-                { Text = "Zapisz", Location = new Point(130, row), Size = new Size(88, 28), FlatStyle = FlatStyle.Flat };
+                { Text = Lang.T("dlg.save"), Location = new Point(196, row), Size = new Size(96, 28), FlatStyle = FlatStyle.Flat };
                 btnSave2.Click += (s2, ev2) =>
                 {
-                    task.Action = cboEditAction.SelectedItem?.ToString()?.Trim() ?? task.Action;
+                    task.Action = ActionIdFromIndex(cboEditAction.SelectedIndex);
                     task.Notes  = txtNotes.Text.Trim();
                     if (task.ActivatorType == 1 && txtIdle != null)
                     {
-                        if (!TimeSpan.TryParse(txtIdle.Text, out _))
-                        { MessageBox.Show("Nieprawidlowy format czasu (HH:MM:SS)."); return; }
+                        if (!TryParseTime(txtIdle.Text, out _))
+                        { MessageBox.Show(Lang.T("msg.badIdleFormat")); return; }
                         task.IdleTimeout = txtIdle.Text.Trim();
                     }
                     else if (task.ActivatorType == 2 && dtpDate != null && txtTime2 != null)
                     {
-                        if (!TimeSpan.TryParse(txtTime2.Text, out var newTime))
-                        { MessageBox.Show("Nieprawidlowy format godziny (HH:MM)."); return; }
+                        if (!TryParseTime(txtTime2.Text, out var newTime))
+                        { MessageBox.Show(Lang.T("msg.badHourFormat")); return; }
                         DateTime newTarget = dtpDate.Value.Date + newTime;
                         if (newTarget <= DateTime.Now)
-                        { MessageBox.Show("Data i godzina musza byc w przyszlosci."); return; }
+                        { MessageBox.Show(Lang.T("msg.futureRequired")); return; }
                         task.LocalTarget = newTarget;
                         task.EndTimeUtc  = newTarget.ToUniversalTime();
                         task.Enabled = true;
@@ -2963,10 +2951,10 @@
                         }
                         else if (!wasInterval && txtHour3 != null && clbDays3 != null)
                         {
-                            if (!TimeSpan.TryParse(txtHour3.Text, out _) && !TimeSpan.TryParse(txtHour3.Text + ":00", out _))
-                            { MessageBox.Show("Nieprawidlowy format godziny (HH:MM)."); return; }
+                            if (!TryParseTime(txtHour3.Text, out _))
+                            { MessageBox.Show(Lang.T("msg.badHourFormat")); return; }
                             if (clbDays3.CheckedIndices.Count == 0)
-                            { MessageBox.Show("Wybierz co najmniej jeden dzien."); return; }
+                            { MessageBox.Show(Lang.T("msg.pickOneDay")); return; }
                             task.ScheduleHour = txtHour3.Text.Trim();
                             task.ScheduleDays = string.Join(",", clbDays3.CheckedIndices.Cast<int>());
                             task.LastFired    = default;
@@ -2978,10 +2966,10 @@
                 };
                 editDlg.Controls.Add(btnSave2);
                 var btnCancel3 = new System.Windows.Forms.Button
-                { Text = "Anuluj", Location = new Point(224, row), Size = new Size(88, 28), FlatStyle = FlatStyle.Flat, DialogResult = DialogResult.Cancel };
+                { Text = Lang.T("dlg.cancel"), Location = new Point(300, row), Size = new Size(96, 28), FlatStyle = FlatStyle.Flat, DialogResult = DialogResult.Cancel };
                 editDlg.Controls.Add(btnCancel3);
                 editDlg.CancelButton = btnCancel3;
-                editDlg.ClientSize = new Size(420, row + 48);
+                editDlg.ClientSize = new Size(500, row + 48);
 
                 if (darkDlg) ApplyThemeToControls(editDlg.Controls,
                     Color.FromArgb(30, 30, 30), Color.FromArgb(220, 220, 220), Color.FromArgb(55, 55, 55), true);
@@ -2989,7 +2977,6 @@
             };
 
             RefreshTaskGrid();
-
 
             checkedListBox1.ItemCheck += (s, ev) =>
             {
@@ -3019,11 +3006,66 @@
                 }
             };
 
+            BuildActivatorTab();
+            BuildTaskFilters();
+            BuildSettingsExtras(settTip);
 
-            ShowLabelBasedOnVersion();
+            RegTip(settTip, button6,  "tip.passwordLock");
+            Reg(label9,  "tasks.header");
+            Reg(button12, "tasks.toggle");
+            Reg(button11, "tasks.edit");
+            Reg(button10, "tasks.delete");
+            Reg(label2,  "lbl.action");
+            Reg(label5,  "lbl.action");
+            Reg(label22, "lbl.action");
+            Reg(label3,  "lbl.idleTime");
+            Reg(label6,  "lbl.moment");
+            Reg(label25, "lbl.moment");
+            Reg(label4,  "lbl.formatHMS");
+            Reg(label7,  "lbl.formatHM");
+            Reg(label24, "lbl.formatHM");
+            Reg(label26, "lbl.repeat");
+            Reg(button2, "btn.addTask");
+            Reg(button4, "btn.addTask");
+            Reg(button8, "btn.addTask");
+            Reg(label27, "set.groupBehaviour");
+            Reg(label28, "set.groupAppearance");
+            Reg(label29, "set.groupSecurity");
+            Reg(label1,  "set.commandLabel");
+            Reg(checkBox1,  "set.autoStartWindows");
+            Reg(checkBox2,  "set.autoCountdown");
+            Reg(checkBox12, "set.autoQueue");
+            Reg(checkBox4,  "set.resetCounter");
+            Reg(checkBox8,  "set.timezone");
+            Reg(checkBox5,  "set.noSleep");
+            Reg(checkBox7,  "set.waitForProcess");
+            Reg(checkBox9,  "set.noTray");
+            Reg(checkBox10, "set.noCountdown");
+            Reg(checkBox3,  "set.minimizeToTray");
+            Reg(checkBox11, "set.darkMode");
+            Reg(checkBox16, "set.noBalloon");
+            Reg(checkBox6,  "set.passwordLock");
+            Reg(checkBox15, "set.runAsAdmin");
+            Reg(button6,  "set.setPassword");
+            Reg(button5,  "set.editConfig");
+            Reg(button7,  "set.resetSettings");
+            Reg(button13, "set.backup");
+            Reg(label20,  "upd.available");
+            Reg(label23,  "upd.upToDate");
+            if (_lblSnoozeHeader != null) Reg(_lblSnoozeHeader, "snooze.header");
+            if (_btnSnooze       != null) Reg(_btnSnooze, "snooze.run");
+
+            Lang.Changed += ApplyLanguage;
+            ApplyIcons();
+            ApplyLanguage();
+            if (checkBox11.Checked) ApplyTheme(true);
+
+            label20.Visible = label20.Enabled = false;
+            label23.Visible = label23.Enabled = false;
+            CheckForUpdate(announceAtStartup: true);
         }
 
-        private void textBox4_TextChanged(object sender, EventArgs e)
+        private void textBox4_TextChanged(object? sender, EventArgs e)
         {
             appSettings["timer1ActivateBy"] = textBox4.Text;
 
@@ -3032,100 +3074,50 @@
 
             if (TimeSpan.TryParse(textBox4.Text, out inputTime) && inputTime > maxTime)
             {
-                textBox5.Text = "Maksymalny okres odliczanego czasu w tym oknie wynosi 1 dzień.";
+                textBox5.Text = Lang.T("msg.maxOneDay");
                 timer1.Stop();
                 textBox4.Text = "24:00:00";
             }
 
-            SaveConfigFile();
+            ScheduleConfigSave();
         }
 
-        private void textBox7_TextChanged(object sender, EventArgs e)
+        private void textBox7_TextChanged(object? sender, EventArgs e)
         {
             appSettings["timer2HourActivateBy"] = textBox7.Text;
-            SaveConfigFile();
+            ScheduleConfigSave();
         }
 
-        private void dateTimePicker1_ValueChanged(object sender, EventArgs e)
+        private void dateTimePicker1_ValueChanged(object? sender, EventArgs e)
         {
             appSettings["timer2DateActivateBy"] = dateTimePicker1.Value.ToString("dd.MM.yyyy", CultureInfo.InvariantCulture);
             SaveConfigFile();
         }
-        private void button1_Click(object sender, EventArgs e)
+        private void checkBox1_CheckedChanged(object? sender, EventArgs e)
         {
-            timer1EndTime = DateTime.Now.Add(TimeSpan.Parse(textBox4.Text));
-            timer1.Start();
-            tabPage2.Enabled = false;
-        }
-
-        private void button2_Click(object sender, EventArgs e)
-        {
-            timer1.Stop();
-            tabPage2.Enabled = true;
-        }
-
-        private void button3_Click(object sender, EventArgs e)
-        {
-            DateTime selectedDate = dateTimePicker1.Value.Date;
-            TimeSpan selectedTime = TimeSpan.Parse(textBox7.Text);
-            DateTime fullSelectedDateTime = selectedDate + selectedTime;
-
-            TimeSpan timeToWait = fullSelectedDateTime - DateTime.Now;
-            if (timeToWait.TotalSeconds <= 0)
-            {
-                textBox9.Text = "Wybrałeś datę z przeszłości, wybierz tę z przyszłości.";
-            }
-            else
-            {
-                _timer2LocalTarget = fullSelectedDateTime;
-                timer2EndTime = DateTime.UtcNow.Add(timeToWait);
-                timer2.Start();
-                tabPage1.Enabled = false;
-            }
-        }
-
-
-        private void button4_Click(object sender, EventArgs e)
-        {
-            timer2.Stop();
-            tabPage1.Enabled = true;
-        }
-
-
-        private void linkLabel1_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e)
-        {
-            var psi = new ProcessStartInfo
-            {
-                FileName = "https://windowsbase.pl",
-                UseShellExecute = true
-            };
-            Process.Start(psi);
-        }
-
-
-        private void checkBox1_CheckedChanged(object sender, EventArgs e)
-        {
+            if (_initializing) return;
             appSettings["runWindowsAuto"] = checkBox1.Checked ? "1" : "0";
             SetAutoStart(checkBox1.Checked);
             SaveConfigFile();
         }
 
-        private void checkBox2_CheckedChanged(object sender, EventArgs e)
+        private void checkBox2_CheckedChanged(object? sender, EventArgs e)
         {
+            if (_initializing) return;
             appSettings["autoStart"] = checkBox2.Checked ? "1" : "0";
-            if (checkBox2.Checked)
+            if (checkBox2.Checked && TryParseTime(textBox4.Text, out var ts2))
             {
-                timer1EndTime = DateTime.Now.Add(TimeSpan.Parse(textBox4.Text));
+                timer1EndTime = DateTime.Now.Add(ts2);
                 timer1.Start();
             }
             SaveConfigFile();
         }
 
-
         private NotifyIcon notifyIcon1 = new NotifyIcon();
 
-        private void checkBox3_CheckedChanged(object sender, EventArgs e)
+        private void checkBox3_CheckedChanged(object? sender, EventArgs e)
         {
+            if (_initializing) return;
             appSettings["noMinimalize"] = checkBox3.Checked ? "1" : "0";
             this.MinimizeBox = !checkBox3.Checked;
             this.FormClosing -= Form1_FormClosing;
@@ -3141,8 +3133,9 @@
             SaveConfigFile();
         }
 
-        private void checkBox4_CheckedChanged(object sender, EventArgs e)
+        private void checkBox4_CheckedChanged(object? sender, EventArgs e)
         {
+            if (_initializing) return;
             appSettings["RunHost"] = checkBox4.Checked ? "1" : "0";
             if (checkBox4.Checked)
             {
@@ -3157,37 +3150,34 @@
             SaveConfigFile();
         }
 
-        private void checkBox5_CheckedChanged(object sender, EventArgs e)
+        private void checkBox5_CheckedChanged(object? sender, EventArgs e)
         {
-            if (appSettings["powerPlanSetID"] == appSettings["powerPlanID"])
-            {
-
-            }
+            if (_initializing) return;
 
             if (checkBox5.Checked)
             {
 
-                var currentPowerPlanGuid = GetCurrentPowerPlanGuid();
-                appSettings["powerPlanID"] = currentPowerPlanGuid;
-                SavePowerPlanGuidToConfigFile(currentPowerPlanGuid);
-
-
-                if (appSettings["powerPlanSetID"] == "")
+                if (string.IsNullOrEmpty(appSettings["powerPlanSetID"]))
                 {
+                    var currentPowerPlanGuid = GetCurrentPowerPlanGuid();
+                    if (!string.IsNullOrEmpty(currentPowerPlanGuid))
+                        SavePowerPlanGuidToConfigFile(currentPowerPlanGuid);
 
                     importedPowerPlanGuid = ImportAndSetActivePowerPlan();
-                    StartPowerPlanMonitor();
                 }
+                else
+                {
+                    importedPowerPlanGuid = appSettings["powerPlanSetID"] ?? "";
+                }
+                StartPowerPlanMonitor();
             }
             else
             {
                 StopPowerPlanMonitor();
 
-                var cmd = new Process { StartInfo = { FileName = "powercfg" } };
-                cmd.StartInfo.CreateNoWindow = true;
-                cmd.StartInfo.WindowStyle = ProcessWindowStyle.Hidden;
-                cmd.StartInfo.Arguments = $"/setactive {appSettings["powerPlanID"]}";
-                cmd.Start();
+                string restore = appSettings["powerPlanID"] ?? "";
+                if (!string.IsNullOrEmpty(restore))
+                    RunPowerCfg($"/setactive {restore}", captureOutput: false);
 
                 RemovePowerPlan();
                 checkBox5.Enabled = false;
@@ -3195,19 +3185,30 @@
             }
         }
 
-
-        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        private void Form1_FormClosing(object? sender, FormClosingEventArgs e)
         {
+
+            try
+            {
+                if (_configSaveTimer.Enabled) { _configSaveTimer.Stop(); SaveConfigFile(); }
+            }
+            catch { }
+
+            if (_forceExit ||
+                e.CloseReason == CloseReason.WindowsShutDown ||
+                e.CloseReason == CloseReason.TaskManagerClosing ||
+                e.CloseReason == CloseReason.ApplicationExitCall)
+                return;
+
             if (checkBox3.Checked)
             {
                 e.Cancel = true;
                 this.Hide();
                 notifyIcon1.Visible = true;
             }
-
         }
 
-        private void Form1_Resize(object sender, EventArgs e)
+        private void Form1_Resize(object? sender, EventArgs e)
         {
             if (this.WindowState == FormWindowState.Minimized && checkBox3.Checked)
             {
@@ -3216,53 +3217,42 @@
             }
         }
 
-        private void NotifyIcon1_DoubleClick(object sender, EventArgs e)
+        private void NotifyIcon1_DoubleClick(object? sender, EventArgs e)
         {
             this.Show();
             this.WindowState = FormWindowState.Normal;
             notifyIcon1.Visible = false;
 
-
             if (appSettings["protect"] == "1")
-            {
-                tabControl1.TabPages["tabPage1"].Enabled = false;
-                tabControl1.TabPages["tabPage2"].Enabled = false;
-                tabControl1.TabPages["tabPage3"].Enabled = false;
-                button6.Enabled = false;
-                label19.Visible = true;
-                label19.Enabled = true;
-                label19.BringToFront();
-            }
+                SetUiLocked(true);
         }
 
-        private void textBoxUser_TextChanged(object sender, EventArgs e)
+        private void textBoxUser_TextChanged(object? sender, EventArgs e)
         {
             appSettings["userSet"] = textBoxUser.Text;
-            SaveConfigFile();
+            ScheduleConfigSave();
         }
 
-        private void button5_Click(object sender, EventArgs e)
+        private void button5_Click(object? sender, EventArgs e)
         {
-            var psi2 = new ProcessStartInfo
+            if (!File.Exists(configFilePath)) SaveConfigFile();
+            TryStartProcess(new ProcessStartInfo
             {
                 FileName = configFilePath,
                 UseShellExecute = true
-            };
-            Process.Start(psi2);
+            });
         }
 
-
-        private void label20_Click(object sender, EventArgs e)
+        private void label20_Click(object? sender, EventArgs e)
         {
-            var psi = new ProcessStartInfo
+            TryStartProcess(new ProcessStartInfo
             {
                 FileName = "https://github.com/Mattronix7200/TimerSysApp/",
                 UseShellExecute = true
-            };
-            Process.Start(psi);
+            });
         }
 
-        private void button7_Click(object sender, EventArgs e)
+        private void button7_Click(object? sender, EventArgs e)
         {
             string scriptPath = GetDataFilePath("fixSettings.ps1");
             if (File.Exists(scriptPath))
@@ -3275,18 +3265,25 @@
                     CreateNoWindow = true,
                     WorkingDirectory = Path.GetDirectoryName(scriptPath)
                 };
-                Process.Start(psi)?.WaitForExit();
+                TryStartProcess(psi, waitForExit: true);
+            }
+            else
+            {
+                MessageBox.Show(Lang.T("msg.noFixScript"),
+                    Lang.T("msg.title"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
-        private void checkBox7_CheckedChanged(object sender, EventArgs e)
+        private void checkBox7_CheckedChanged(object? sender, EventArgs e)
         {
+            if (_initializing) return;
             appSettings["userCommandBehaviour"] = checkBox7.Checked ? "1" : "0";
             SaveConfigFile();
         }
 
-        private void checkBox8_CheckedChanged(object sender, EventArgs e)
+        private void checkBox8_CheckedChanged(object? sender, EventArgs e)
         {
+            if (_initializing) return;
             appSettings["timezoneCheck"] = checkBox8.Checked ? "1" : "0";
             SaveConfigFile();
             if (checkBox8.Checked)
@@ -3295,7 +3292,7 @@
                 SystemEvents.TimeChanged -= SystemEvents_TimeChanged;
         }
 
-        private void SystemEvents_TimeChanged(object sender, EventArgs e)
+        private void SystemEvents_TimeChanged(object? sender, EventArgs e)
         {
             BeginInvoke(new Action(() =>
             {
@@ -3314,15 +3311,17 @@
             }));
         }
 
-        private void checkBox9_CheckedChanged(object sender, EventArgs e)
+        private void checkBox9_CheckedChanged(object? sender, EventArgs e)
         {
+            if (_initializing) return;
             appSettings["noTray"] = checkBox9.Checked ? "1" : "0";
             SaveConfigFile();
             notifyIcon1.Visible = !checkBox9.Checked;
         }
 
-        private void checkBox10_CheckedChanged(object sender, EventArgs e)
+        private void checkBox10_CheckedChanged(object? sender, EventArgs e)
         {
+            if (_initializing) return;
             appSettings["noTimerShow"] = checkBox10.Checked ? "1" : "0";
             SaveConfigFile();
             bool show = !checkBox10.Checked;
@@ -3330,8 +3329,9 @@
             textBox9.Visible = show;
         }
 
-        private void checkBox11_CheckedChanged(object sender, EventArgs e)
+        private void checkBox11_CheckedChanged(object? sender, EventArgs e)
         {
+            if (_initializing) return;
             appSettings["darkModeEnabled"] = checkBox11.Checked ? "1" : "0";
             SaveConfigFile();
             ApplyTheme(checkBox11.Checked);
@@ -3344,6 +3344,10 @@
             Color input = dark ? Color.FromArgb(55, 55, 55) : SystemColors.Window;
             this.BackColor = dark ? Color.FromArgb(25, 25, 25) : SystemColors.Control;
             ApplyThemeToControls(this.Controls, bg, fg, input, dark);
+
+            if (_lblModeIntro != null)
+                _lblModeIntro.ForeColor = dark ? Color.FromArgb(165, 165, 170) : Color.FromArgb(90, 90, 95);
+            ApplyIcons();
         }
 
         private void ApplyThemeToControls(Control.ControlCollection controls, Color bg, Color fg, Color input, bool dark)
@@ -3352,11 +3356,23 @@
             {
                 string typeName = ctrl.GetType().Name;
                 if (typeName == "TabPage" || typeName == "GroupBox" || typeName == "Panel")
+                {
                     ctrl.BackColor = bg;
+                    if (typeName == "GroupBox") ctrl.ForeColor = fg;
+                }
                 else if (typeName == "TextBox" || typeName == "ComboBox" || typeName == "DateTimePicker" || typeName == "CheckedListBox")
                 {
-                    ctrl.BackColor = input;
-                    ctrl.ForeColor = fg;
+
+                    if (ctrl is TextBox { ReadOnly: true, BorderStyle: BorderStyle.None })
+                    {
+                        ctrl.BackColor = bg;
+                        ctrl.ForeColor = dark ? Color.FromArgb(110, 175, 255) : SystemColors.MenuHighlight;
+                    }
+                    else
+                    {
+                        ctrl.BackColor = input;
+                        ctrl.ForeColor = fg;
+                    }
                 }
                 else if (typeName == "Label")
                 {
@@ -3364,10 +3380,30 @@
                     if (ctrl.BackColor != Color.SlateGray)
                     { ctrl.BackColor = Color.Transparent; ctrl.ForeColor = fg; }
                 }
+
+                else if (typeName == "LinkLabel")
+                {
+                    var link = (LinkLabel)ctrl;
+                    link.BackColor = Color.Transparent;
+                    link.ForeColor = fg;
+                    link.LinkColor       = dark ? Color.FromArgb(110, 180, 255) : Color.FromArgb(0, 102, 204);
+                    link.ActiveLinkColor = dark ? Color.FromArgb(150, 205, 255) : Color.FromArgb(0, 80, 160);
+                    link.VisitedLinkColor = link.LinkColor;
+                }
+                else if (typeName == "NumericUpDown" || typeName == "ListBox" || typeName == "RichTextBox")
+                {
+                    ctrl.BackColor = input;
+                    ctrl.ForeColor = fg;
+                }
+                else if (typeName == "RadioButton")
+                {
+                    ctrl.BackColor = bg;
+                    ctrl.ForeColor = fg;
+                }
                 else if (typeName == "DataGridView")
                 {
                     var dgv = (DataGridView)ctrl;
-                    dgv.BackgroundColor = dark ? Color.FromArgb(30, 30, 30) : SystemColors.AppWorkspace;
+                    dgv.BackgroundColor = dark ? Color.FromArgb(42, 42, 45) : SystemColors.AppWorkspace;
                     dgv.DefaultCellStyle.BackColor = dark ? Color.FromArgb(42, 42, 45) : SystemColors.Window;
                     dgv.DefaultCellStyle.ForeColor = fg;
                     dgv.DefaultCellStyle.SelectionBackColor = dark ? Color.FromArgb(60, 80, 115) : SystemColors.Highlight;
@@ -3388,7 +3424,16 @@
                     var btn = ctrl as System.Windows.Forms.Button;
                     if (btn != null)
                     {
-                        if (dark) { btn.FlatStyle = FlatStyle.Flat; btn.BackColor = Color.FromArgb(58, 58, 58); btn.FlatAppearance.BorderColor = Color.FromArgb(90, 90, 90); }
+                        if (dark)
+                        {
+
+                            btn.FlatStyle = FlatStyle.Flat;
+                            btn.BackColor = Color.FromArgb(64, 64, 70);
+                            btn.FlatAppearance.BorderSize          = 1;
+                            btn.FlatAppearance.BorderColor         = Color.FromArgb(108, 108, 116);
+                            btn.FlatAppearance.MouseOverBackColor  = Color.FromArgb(82, 82, 90);
+                            btn.FlatAppearance.MouseDownBackColor  = Color.FromArgb(96, 96, 104);
+                        }
                         else { btn.FlatStyle = FlatStyle.Standard; btn.BackColor = SystemColors.ButtonFace; }
                         btn.ForeColor = fg;
                     }
@@ -3400,10 +3445,46 @@
             }
         }
 
+        private void CleanupResources()
+        {
+            StopSound();
+            try { SystemEvents.TimeChanged -= SystemEvents_TimeChanged; } catch { }
+            StopPowerPlanMonitor();
+
+            try
+            {
+                if (_configSaveTimer.Enabled)
+                {
+                    _configSaveTimer.Stop();
+                    SaveConfigFile();
+                }
+            }
+            catch { }
+
+            foreach (var t in new[] { timer1, timer2, timer3, _timerSnooze, _timerStatusUI, _configSaveTimer })
+            {
+                try { t.Stop(); t.Dispose(); } catch { }
+            }
+
+            foreach (var toast in _activeToasts.ToList())
+            {
+                try { if (!toast.IsDisposed) toast.Close(); } catch { }
+            }
+            _activeToasts.Clear();
+
+            try { notifyIcon1.Visible = false; notifyIcon1.Dispose(); } catch { }
+            try { _actionTip.Dispose(); } catch { }
+            try { _logoScaled?.Dispose(); _logoScaled = null; } catch { }
+
+            foreach (var d in _disposables)
+            {
+                try { d.Dispose(); } catch { }
+            }
+            _disposables.Clear();
+        }
 
         private static string GetDataFilePath(string filename) =>
             Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data", filename);
-
 
         private static void EnsureDataFiles()
         {
@@ -3427,6 +3508,7 @@
                 }
             }
 
+            SoundCatalog.EnsureExtracted();
 
             string soundsDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "sounds");
             Directory.CreateDirectory(soundsDir);
@@ -3441,11 +3523,14 @@
                 }
             }
 
-
             string versionFile = Path.Combine(dataDir, "version.txt");
-            if (!File.Exists(versionFile))
-                File.WriteAllText(versionFile, "1.0.6");
-
+            try
+            {
+                string current = AppVersion;
+                if (!File.Exists(versionFile) || File.ReadAllText(versionFile).Trim() != current)
+                    File.WriteAllText(versionFile, current);
+            }
+            catch { }
 
             string iconsDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "icons");
             Directory.CreateDirectory(iconsDir);
@@ -3466,17 +3551,16 @@
             }
         }
 
-
         private void StartSchedule()
         {
-            if (!TimeSpan.TryParse(textBox1.Text, out _) && !TimeSpan.TryParse(textBox1.Text + ":00", out _))
+            if (!TryParseTime(textBox1.Text, out _))
             {
-                MessageBox.Show("Podaj godzinę w formacie HH:MM", "Błąd", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(Lang.T("msg.badHourFormat"), Lang.T("msg.error"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
             if (checkedListBox1.CheckedItems.Count == 0)
             {
-                MessageBox.Show("Wybierz co najmniej jeden termin powtarzania.", "Błąd", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(Lang.T("msg.pickDay"), Lang.T("msg.error"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
             appSettings["timer3HourActivateBy"] = textBox1.Text;
@@ -3486,8 +3570,7 @@
             timer3.Start();
         }
 
-
-        private void ToggleScheduleFromTray(object sender, EventArgs e) =>
+        private void ToggleScheduleFromTray(object? sender, EventArgs e) =>
             SetHarmonogramRunning(appSettings["timer3UserPaused"] == "1");
 
         private void ApplyHarmonogramUI(bool running)
@@ -3498,9 +3581,14 @@
             textBox1.Enabled = running;
             if (_btnActSettings3 != null)
                 _btnActSettings3.Enabled = running && ActionHasParams(comboBox3.SelectedIndex);
-            stopStartHarmonogram.Text = running ? "⏸ Zatrzymaj harmonogram" : "▶ Uruchom harmonogram";
+            stopStartHarmonogram.Text = Lang.T(running ? "sched.stop" : "sched.start");
+            SetIcon(stopStartHarmonogram, running ? Ico.Stop : Ico.Play);
             if (_menuScheduleToggle != null)
-                _menuScheduleToggle.Text = running ? "⏸ Zatrzymaj harmonogram" : "▶ Uruchom harmonogram";
+            {
+                _menuScheduleToggle.Text  = Lang.T(running ? "sched.stop" : "sched.start");
+                _menuScheduleToggle.Image = VectorIcons.Get(running ? Ico.Stop : Ico.Play, 16,
+                                                            Color.FromArgb(70, 70, 74));
+            }
         }
 
         private void SetHarmonogramRunning(bool running)
@@ -3522,18 +3610,17 @@
             ApplyHarmonogramUI(running);
         }
 
-
         private void AddTaskAndRun(int activatorType)
         {
+
             string action = activatorType switch
             {
-                1 => comboBox1.SelectedItem?.ToString() ?? "",
-                2 => comboBox2.SelectedItem?.ToString() ?? "",
-                3 => comboBox3.SelectedItem?.ToString() ?? "",
+                1 => ActionIdFromIndex(comboBox1.SelectedIndex),
+                2 => ActionIdFromIndex(comboBox2.SelectedIndex),
+                3 => ActionIdFromIndex(comboBox3.SelectedIndex),
                 _ => ""
             };
             if (string.IsNullOrEmpty(action)) return;
-
 
             var task = new TaskEntry { ActivatorType = activatorType, Action = action, Enabled = true };
             _taskList.Add(task);
@@ -3543,9 +3630,9 @@
             switch (activatorType)
             {
                 case 1:
-                    if (!TimeSpan.TryParse(textBox4.Text, out var ts1))
+                    if (!TryParseTime(textBox4.Text, out var ts1))
                     {
-                        MessageBox.Show("Nieprawidłowy format czasu bezczynności.", "Błąd",
+                        MessageBox.Show(Lang.T("msg.badIdleFormat"), Lang.T("msg.error"),
                             MessageBoxButtons.OK, MessageBoxIcon.Warning);
                         _taskList.Remove(task); SaveConfigFile(); RefreshTaskGrid();
                         return;
@@ -3559,21 +3646,15 @@
                     break;
 
                 case 2:
-                    if (!TimeSpan.TryParse(textBox7.Text, out var selTime))
+                    if (!TryGetTimerTarget(out DateTime target, out string targetError))
                     {
-                        MessageBox.Show("Nieprawidłowy format czasu.", "Błąd",
+                        textBox9.Text = targetError;
+                        MessageBox.Show(targetError, Lang.T("msg.error"),
                             MessageBoxButtons.OK, MessageBoxIcon.Warning);
                         _taskList.Remove(task); SaveConfigFile(); RefreshTaskGrid();
                         return;
                     }
-                    DateTime target = dateTimePicker1.Value.Date + selTime;
                     TimeSpan toWait = target - DateTime.Now;
-                    if (toWait.TotalSeconds <= 0)
-                    {
-                        textBox9.Text = "Wybrałeś datę z przeszłości, wybierz tę z przyszłości.";
-                        _taskList.Remove(task); SaveConfigFile(); RefreshTaskGrid();
-                        return;
-                    }
 
                     task.EndTimeUtc  = DateTime.UtcNow.Add(toWait);
                     task.LocalTarget = target;
@@ -3609,12 +3690,10 @@
                     break;
             }
 
-
             tabControl1.SelectedTab = tabControl1.TabPages["tabPage5"];
         }
 
-
-        private void Timer3_Tick(object sender, EventArgs e)
+        private void Timer3_Tick(object? sender, EventArgs e)
         {
             var now = DateTime.Now;
             var current = new TimeSpan(now.Hour, now.Minute, 0);
@@ -3643,10 +3722,8 @@
                     continue;
                 }
 
-
                 string hourStr = string.IsNullOrEmpty(t.ScheduleHour) ? textBox1.Text : t.ScheduleHour;
-                if (!TimeSpan.TryParse(hourStr, out var targetTime))
-                    if (!TimeSpan.TryParse(hourStr + ":00", out targetTime)) continue;
+                if (!TryParseTime(hourStr, out var targetTime)) continue;
 
                 if (Math.Abs((current - targetTime).TotalMinutes) >= 0.5) continue;
                 if (t.LastFired.Date == now.Date) continue;
@@ -3675,8 +3752,7 @@
 
         private DateTime? GetNextScheduleFireTime()
         {
-            if (!TimeSpan.TryParse(textBox1.Text, out var targetTime))
-                if (!TimeSpan.TryParse(textBox1.Text + ":00", out targetTime)) return null;
+            if (!TryParseTime(textBox1.Text, out var targetTime)) return null;
             if (checkedListBox1.CheckedItems.Count == 0) return null;
 
             for (int daysAhead = 0; daysAhead <= 8; daysAhead++)
@@ -3718,14 +3794,12 @@
             return false;
         }
 
-
         private bool IsTodayScheduled()
         {
             var daysStr = string.Join(",", checkedListBox1.CheckedIndices.Cast<int>());
             DateTime.TryParse(appSettings["timer3LastFired"] ?? "", out DateTime lastFired);
             return IsTaskScheduledToday(daysStr, lastFired, DateTime.Now);
         }
-
 
         private static bool IsTaskScheduledToday(string daysStr, DateTime lastFired, DateTime today)
         {
@@ -3757,7 +3831,6 @@
             return false;
         }
 
-
         private void RefreshTaskGrid()
         {
             if (dataGridView1 == null) return;
@@ -3767,15 +3840,15 @@
                 : _taskList.Where(t => t.ActivatorType == _taskListFilter).ToList();
             foreach (var t in items)
             {
-                string actName = t.ActivatorType switch
+                string actName = Lang.T(t.ActivatorType switch
                 {
-                    1 => "Bezczynność",
-                    2 => "Stoper",
-                    3 => "Harmonogram",
+                    1 => "mode.idle",
+                    2 => "mode.timer",
+                    3 => "mode.schedule",
                     _ => "?"
-                };
+                });
                 int rowIdx = dataGridView1.Rows.Add(
-                    t.Action,
+                    ActionDisplay(t.Action),
                     GetTaskNextActivation(t),
                     t.Enabled ? "✓" : "✗",
                     actName
@@ -3783,21 +3856,21 @@
                 dataGridView1.Rows[rowIdx].Tag = t.Id;
 
                 if (!t.Enabled)
-                    dataGridView1.Rows[rowIdx].DefaultCellStyle.ForeColor = Color.Gray;
+                    dataGridView1.Rows[rowIdx].DefaultCellStyle.ForeColor =
+                        checkBox11.Checked ? Color.FromArgb(140, 140, 140) : Color.Gray;
             }
         }
 
-
         private string GetTaskNextActivation(TaskEntry t)
         {
-            if (!t.Enabled) return "Wykonane";
+            if (!t.Enabled) return Lang.T(t.Completed ? "val.done" : "val.paused");
             switch (t.ActivatorType)
             {
                 case 2:
                     if (t.EndTimeUtc != default)
                     {
                         var rem = t.EndTimeUtc - DateTime.UtcNow;
-                        return rem.TotalSeconds > 0 ? rem.ToString(@"hh\:mm\:ss") : "Wygasło";
+                        return rem.TotalSeconds > 0 ? FormatRemaining(rem) : Lang.T("val.expired");
                     }
                     return "-";
                 case 3:
@@ -3812,13 +3885,12 @@
                         };
                         var nextFire = t.LastFired.AddMinutes(iMin);
                         var rem = nextFire - DateTime.Now;
-                        string unitLabel = t.RepeatIntervalType switch { "h" => "godz", "d" => "dni", _ => "min" };
-                        string prefix = $"co {t.RepeatIntervalValue} {unitLabel}: ";
-                        return prefix + (rem.TotalSeconds > 0 ? rem.ToString(@"hh\:mm\:ss") : "Zaraz...");
+                        string unitLabel = Lang.T(t.RepeatIntervalType switch { "h" => "unit.hour", "d" => "unit.day", _ => "unit.min" });
+                        string prefix = Lang.T("val.every", t.RepeatIntervalValue, unitLabel) + ": ";
+                        return prefix + (rem.TotalSeconds > 0 ? FormatRemaining(rem) : Lang.T("val.soon"));
                     }
                     string hourStr = string.IsNullOrEmpty(t.ScheduleHour) ? textBox1.Text : t.ScheduleHour;
-                    if (!TimeSpan.TryParse(hourStr, out var targetTime))
-                        if (!TimeSpan.TryParse(hourStr + ":00", out targetTime)) return "-";
+                    if (!TryParseTime(hourStr, out var targetTime)) return "-";
                     string daysStr = string.IsNullOrEmpty(t.ScheduleDays)
                         ? string.Join(",", checkedListBox1.CheckedIndices.Cast<int>())
                         : t.ScheduleDays;
@@ -3831,7 +3903,12 @@
                     }
                     return "-";
                 case 1:
-                    return timer1.Enabled ? "Przy bezczynnosci" : "Oczekuje";
+                {
+                    var threshold = IdleThresholdFor(t);
+                    if (!timer1.Enabled || threshold == null) return Lang.T("val.waiting");
+                    var left = threshold.Value - TimeSpan.FromMilliseconds(GetIdleMilliseconds());
+                    return left.TotalSeconds > 0 ? FormatRemaining(left) : Lang.T("val.soon");
+                }
                 default:
                     return "-";
             }
@@ -3839,13 +3916,14 @@
 
     }
 
-
     public class TaskEntry
     {
         public string   Id            { get; set; } = Guid.NewGuid().ToString("N")[..8];
         public int      ActivatorType { get; set; }
         public string   Action        { get; set; } = "";
         public bool     Enabled       { get; set; } = true;
+
+        public bool     Completed     { get; set; }
         public string   Notes         { get; set; } = "";
 
         public DateTime EndTimeUtc    { get; set; }

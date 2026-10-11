@@ -1,74 +1,62 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
-using System.Drawing;
-using System.Linq;
-using System.Reflection.Emit;
-using System.Security.Cryptography;
-using System.Text;
-using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace TimerSys
 {
     public partial class Form2 : Form
     {
+        private const int MinPasswordLength = 4;
+
         public Form2()
         {
             InitializeComponent();
-        }
 
+            AcceptButton = button1;
+            Text        = Lang.T("pwd.setTitle");
+            label1.Text = Lang.T("pwd.first");
+            label2.Text = Lang.T("pwd.repeat");
+            button1.Text = Lang.T("dlg.ok");
+            textBox1.MaxLength = 64;
+            textBox2.MaxLength = 64;
+            label3.Text = "";
+        }
 
         private void button1_Click(object sender, EventArgs e)
         {
-            if (textBox1.Text != textBox2.Text)
+            string password = textBox1.Text;
+
+            if (password.Length < MinPasswordLength)
             {
-                label3.Text = "Hasła nie zgadzają się. Spróbuj ponownie!";
+                label3.Text = Lang.T("pwd.tooShort", MinPasswordLength);
+                return;
             }
-            else
+            if (password != textBox2.Text)
             {
-                string password = textBox1.Text;
-                string hashedPassword = ComputeMD5Hash(password);
-                string dataLocation = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "./data/psd.dat");
-                File.WriteAllText(dataLocation, hashedPassword);
-                this.Close();
+                label3.Text = Lang.T("pwd.mismatch");
+                return;
             }
-        }
 
-        private string ComputeMD5Hash(string input)
-        {
-            using (MD5 md5 = MD5.Create())
+            if (!PasswordStore.Save(password))
             {
-                byte[] inputBytes = Encoding.ASCII.GetBytes(input);
-                byte[] hashBytes = md5.ComputeHash(inputBytes);
-
-                StringBuilder sb = new StringBuilder();
-                for (int i = 0; i < hashBytes.Length; i++)
-                {
-                    sb.Append(hashBytes[i].ToString("X2"));
-                }
-                return sb.ToString();
+                MessageBox.Show(Lang.T("pwd.saveFailed"),
+                    Lang.T("msg.title"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
             }
+
+            DialogResult = DialogResult.OK;
+            Close();
         }
 
-        private void textBox1_TextChanged(object sender, EventArgs e)
-        {
+        private void textBox1_TextChanged(object sender, EventArgs e) => label3.Text = "";
 
-        }
+        private void textBox2_TextChanged(object sender, EventArgs e) => label3.Text = "";
 
-        private void textBox2_TextChanged(object sender, EventArgs e)
-        {
-
-        }
         private void label1_Click(object sender, EventArgs e)
         {
-
         }
 
         private void Form2_Load(object sender, EventArgs e)
         {
-
         }
     }
 }

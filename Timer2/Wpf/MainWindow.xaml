@@ -1,0 +1,140 @@
+﻿<Window x:Class="TimerSys.Wpf.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
+        Title="Wyłącznik czasowy"
+        Width="1000" Height="680"
+        MinWidth="820" MinHeight="600"
+        WindowStartupLocation="CenterScreen"
+        Background="{DynamicResource WindowBrush}"
+        TextOptions.TextFormattingMode="Display"
+        UseLayoutRounding="True">
+
+    <shell:WindowChrome.WindowChrome>
+        <shell:WindowChrome CaptionHeight="0"
+                            CornerRadius="0"
+                            GlassFrameThickness="0"
+                            ResizeBorderThickness="6"
+                            UseAeroCaptionButtons="False" />
+    </shell:WindowChrome.WindowChrome>
+
+    <Border Background="{DynamicResource WindowBrush}"
+            BorderBrush="{DynamicResource BorderBrush}"
+            BorderThickness="1"
+            TextElement.Foreground="{DynamicResource TextBrush}">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="46" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <Border x:Name="TitleBar"
+                    Grid.Row="0"
+                    Background="{DynamicResource ChromeBrush}"
+                    BorderBrush="{DynamicResource BorderBrush}"
+                    BorderThickness="0,0,0,1"
+                    MouseLeftButtonDown="TitleBar_MouseLeftButtonDown">
+                <Grid>
+                    <StackPanel Margin="14,0,0,0"
+                                HorizontalAlignment="Left"
+                                VerticalAlignment="Center"
+                                Orientation="Horizontal">
+                        <Image x:Name="AppIcon"
+                               Width="24" Height="24"
+                               Margin="0,0,10,0"
+                               RenderOptions.BitmapScalingMode="HighQuality" />
+                        <TextBlock x:Name="LblTitle"
+                                   VerticalAlignment="Center"
+                                   FontSize="13"
+                                   Foreground="{DynamicResource TextBrush}" />
+                    </StackPanel>
+
+                    <StackPanel HorizontalAlignment="Right"
+                                Orientation="Horizontal"
+                                WindowChrome.IsHitTestVisibleInChrome="True">
+                        <Button x:Name="BtnHelp"
+                                Width="46" Height="46"
+                                Click="BtnHelp_Click"
+                                Style="{StaticResource IconButton}" />
+                        <Button x:Name="BtnMinimize"
+                                Width="46" Height="46"
+                                Click="BtnMinimize_Click"
+                                Style="{StaticResource IconButton}" />
+                        <Button x:Name="BtnClose"
+                                Width="46" Height="46"
+                                Click="BtnClose_Click"
+                                Style="{StaticResource IconButton}" />
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <Grid Grid.Row="1">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition x:Name="NavColumn" Width="212" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Border Grid.Column="0"
+                        Background="{DynamicResource NavBrush}"
+                        BorderBrush="{DynamicResource BorderBrush}"
+                        BorderThickness="0,0,1,0">
+                    <DockPanel Margin="10,12,10,12">
+                        <Button x:Name="BtnNavToggle"
+                                DockPanel.Dock="Top"
+                                Height="36"
+                                Margin="0,0,0,10"
+                                Click="BtnNavToggle_Click"
+                                Style="{StaticResource SquareIconButton}" />
+
+                        <StackPanel x:Name="BottomBar" DockPanel.Dock="Bottom" VerticalAlignment="Bottom">
+                            <Border Height="1"
+                                    Margin="2,10"
+                                    Background="{DynamicResource BorderBrush}" />
+                            <TextBlock x:Name="LblStatus"
+                                       Margin="4,2,4,8"
+                                       TextWrapping="Wrap"
+                                       Style="{StaticResource Hint}" />
+                            <UniformGrid x:Name="ToolRow" Columns="2">
+                                <Button x:Name="BtnTheme"
+                                        Height="38"
+                                        Margin="0,0,4,0"
+                                        Click="BtnTheme_Click"
+                                        Style="{StaticResource SquareIconButton}" />
+                                <Button x:Name="BtnLanguage"
+                                        Height="38"
+                                        Margin="4,0,0,0"
+                                        Click="BtnLanguage_Click"
+                                        Style="{StaticResource SquareIconButton}" />
+                            </UniformGrid>
+                        </StackPanel>
+
+                        <StackPanel x:Name="NavPanel" DockPanel.Dock="Top" />
+
+                        <Grid />
+                    </DockPanel>
+                </Border>
+
+                <ContentControl x:Name="PageHost" Grid.Column="1" />
+
+                <Grid x:Name="LockOverlay"
+                      Grid.Column="0" Grid.ColumnSpan="2"
+                      Background="#E6101114"
+                      Visibility="Collapsed"
+                      MouseLeftButtonDown="LockOverlay_Click"
+                      Cursor="Hand">
+                    <StackPanel VerticalAlignment="Center">
+                        <Image x:Name="LockImage"
+                               MaxWidth="520"
+                               Stretch="Uniform"
+                               RenderOptions.BitmapScalingMode="HighQuality" />
+                        <TextBlock x:Name="LblLockHint"
+                                   Margin="0,18,0,0"
+                                   HorizontalAlignment="Center"
+                                   Foreground="#DDE1E8"
+                                   FontSize="13" />
+                    </StackPanel>
+                </Grid>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>

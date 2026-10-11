@@ -1,12 +1,4 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
-using System.Drawing;
-using System.Linq;
-using System.Security.Cryptography;
-using System.Text;
-using System.Threading.Tasks;
 using System.Windows.Forms;
 using Timer2;
 
@@ -14,45 +6,61 @@ namespace TimerSys
 {
     public partial class Form3 : Form
     {
-        public Form1 MainForm { get; set; } // Dodaj to pole
+        public Form1? MainForm { get; set; }
+
+        private int _failedAttempts;
 
         public Form3()
         {
             InitializeComponent();
+            AcceptButton = button1;
+            textBox1.MaxLength = 64;
+            Text         = Lang.T("pwd.dlgTitle");
+            label1.Text  = Lang.T("pwd.enter");
+            button1.Text = Lang.T("dlg.ok");
+            label2.Visible = false;
+            label2.Enabled = false;
         }
 
         private void button1_Click(object sender, EventArgs e)
         {
-            string password = textBox1.Text;
-            string hashedPassword = ComputeMD5Hash(password);
-            string dataLocation = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "./data/psd.dat");
-            string savedPassword = File.ReadAllText(dataLocation);
-
-            if (hashedPassword == savedPassword)
+            if (!PasswordStore.Exists())
             {
-                MainForm.UnlockScreen();
-                this.Close();
+
+                MessageBox.Show(Lang.T("pwd.missing"),
+                    Lang.T("msg.title"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MainForm?.UnlockScreen();
+                Close();
+                return;
             }
-            else
+
+            if (PasswordStore.Verify(textBox1.Text))
             {
-                label2.Visible = true;
-                label2.Enabled = true;
+                _failedAttempts = 0;
+                MainForm?.UnlockScreen();
+                Close();
+                return;
             }
-        }
 
-        private string ComputeMD5Hash(string input)
-        {
-            using (MD5 md5 = MD5.Create())
+            _failedAttempts++;
+            label2.Text = Lang.T(_failedAttempts >= 5 ? "pwd.wrongWait" : "pwd.wrong");
+            label2.Visible = true;
+            label2.Enabled = true;
+            textBox1.SelectAll();
+            textBox1.Focus();
+
+            if (_failedAttempts >= 5)
             {
-                byte[] inputBytes = Encoding.ASCII.GetBytes(input);
-                byte[] hashBytes = md5.ComputeHash(inputBytes);
 
-                StringBuilder sb = new StringBuilder();
-                for (int i = 0; i < hashBytes.Length; i++)
+                button1.Enabled = false;
+                var delay = new System.Windows.Forms.Timer { Interval = 3000 };
+                delay.Tick += (s, ev) =>
                 {
-                    sb.Append(hashBytes[i].ToString("X2"));
-                }
-                return sb.ToString();
+                    delay.Stop();
+                    delay.Dispose();
+                    if (!IsDisposed) button1.Enabled = true;
+                };
+                delay.Start();
             }
         }
 
@@ -61,6 +69,5 @@ namespace TimerSys
             label2.Visible = false;
             label2.Enabled = false;
         }
-
     }
 }

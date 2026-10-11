@@ -1,13 +1,4 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
-using System.Drawing;
-using System.Linq;
-using System.Reflection.Emit;
-using System.Security.Cryptography;
-using System.Text;
-using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace TimerSys
@@ -18,32 +9,21 @@ namespace TimerSys
         {
             InitializeComponent();
 
-            string password = "123456";
-            string hashedPassword = ComputeMD5Hash(password);
-            string dataLocation = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "./data/psd.dat");
-            File.WriteAllText(dataLocation, hashedPassword);
-            //this.Close();
-        }
+            Text        = Lang.T("welcome.title");
+            label1.Text = Lang.T("welcome.intro");
+            label3.Text = Lang.T("welcome.note");
+            button1.Text = Lang.T("dlg.ok");
+            AcceptButton = button1;
 
-        private string ComputeMD5Hash(string input)
-        {
-            using (MD5 md5 = MD5.Create())
+            if (!PasswordStore.Exists() && !PasswordStore.Save("123456"))
             {
-                byte[] inputBytes = Encoding.ASCII.GetBytes(input);
-                byte[] hashBytes = md5.ComputeHash(inputBytes);
-
-                StringBuilder sb = new StringBuilder();
-                for (int i = 0; i < hashBytes.Length; i++)
-                {
-                    sb.Append(hashBytes[i].ToString("X2"));
-                }
-                return sb.ToString();
+                MessageBox.Show(Lang.T("pwd.saveFailed"),
+                    Lang.T("msg.title"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
-        private void label1_Click(object sender, EventArgs e)
+        private void label1_Click(object? sender, EventArgs e)
         {
-
         }
     }
 }
