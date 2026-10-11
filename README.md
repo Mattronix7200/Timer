@@ -12,7 +12,7 @@ Najnowsze wersje instalacyjne oraz kod źródłowy znajdziesz w zakładce **[Rel
 
 ## 📸 Zrzut ekranu
 
-<img width="785" height="633" alt="Interfejs programu Wyłącznik czasowy" src="https://github.com/user-attachments/assets/4eb6ef06-92b0-4245-ac32-20f4b9121522" />
+<img width="1069" height="732" alt="Screenshot" src="https://github.com/user-attachments/assets/503f4d70-4f75-407c-a798-bab73e0a548a" />
 
 
 ## ✨ Kluczowe funkcje
