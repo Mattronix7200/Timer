@@ -7,7 +7,7 @@
 
 Najnowsze wersje instalacyjne oraz kod źródłowy znajdziesz w zakładce **[Releases](https://github.com/Mattronix7200/TimerSysApp/releases)**.
 
-🔗 **[Pobierz najnowsze wydanie](https://github.com/Mattronix7200/TimerSysApp/releases/tag/release-1.0.6)**
+🔗 **[Pobierz najnowsze wydanie](https://github.com/Mattronix7200/TimerSysApp/releases/tag/release-1.0.7)**
 
 
 ## 📸 Zrzut ekranu
