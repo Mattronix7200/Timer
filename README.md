@@ -48,11 +48,11 @@ Najnowsze wersje instalacyjne oraz kod źródłowy znajdziesz w zakładce **[Rel
 ---
 
 <details>
-<summary><b>🇬🇧 English Description (Click to expand)</b></summary>
+<summary><b>English Description (Click to expand)</b></summary>
 
 # Timer
 
-**Timer** is an advanced yet lightweight tool designed to automate daily tasks on Windows computers. The application allows you to execute predefined actions after a countdown, based on a schedule, or upon detecting user inactivity. Unlike basic system commands, TimerSys supports a wide variety of operations—ranging from standard power management to sending emails, capturing screenshots, cleaning disks, and executing custom scripts.
+**Timer** is an advanced yet lightweight tool designed to automate daily tasks on Windows computers. The application allows you to execute predefined actions after a countdown, based on a schedule, or upon detecting user inactivity. Unlike basic system commands, it supports a wide variety of operations—ranging from standard power management to sending emails, capturing screenshots, cleaning disks, and executing custom scripts.
 
 ## 🚀 Download
 You can download the latest installation packages and source code directly from the **[Releases](https://github.com/Mattronix7200/TimerSysApp/releases)** page.
