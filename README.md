@@ -1,61 +1,9 @@
-# Wyłącznik czasowy (Timer)
+<p align="center"><img width="50%" height="50%" alt="logo" src="https://github.com/user-attachments/assets/531b54a9-9780-4aa8-8157-f5ff7c976742" /></p>
 
-**Wyłącznik czasowy** to zaawansowane, a zarazem lekkie narzędzie stworzone z myślą o automatyzacji codziennych zadań na komputerze z systemem Windows. Aplikacja pozwala na wykonywanie określonych akcji po odliczeniu czasu, w oparciu o harmonogram lub w odpowiedzi na bezczynność użytkownika. W przeciwieństwie do prostych komend systemowych, program oferuje bogaty wachlarz operacji – od standardowego zarządzania zasilaniem po wysyłanie wiadomości e-mail czy czyszczenie dysku. Sprawdzi się idealnie zarówno w zastosowaniach domowych, jak i w środowisku firmowym.
-
-
-## 🚀 Pobierz program
-
-Najnowsze wersje instalacyjne oraz kod źródłowy znajdziesz w zakładce **[Releases](https://github.com/Mattronix7200/TimerSysApp/releases)**.
-
-🔗 **[Pobierz najnowsze wydanie](https://github.com/Mattronix7200/TimerSysApp/releases/tag/release-1.0.7)**
-
-
-## 📸 Zrzut ekranu
-
-<img width="1069" height="732" alt="Screenshot" src="https://github.com/user-attachments/assets/503f4d70-4f75-407c-a798-bab73e0a548a" />
-
-
-## ✨ Kluczowe funkcje
-
-* **Elastyczne tryby pracy:**
-  * **Stoper / Odliczanie:** Szybkie odliczanie określonego czasu (HH:MM:SS) bez konieczności podawania dokładnej daty lub tradycyjny harmonogram na konkretną godzinę.
-  * **Tryb bezczynności:** Automatyczna aktywacja zadania, gdy system pozostaje bezużyteczny przez określony czas.
-* **Bogaty wybór akcji:**
-  * Zarządzanie zasilaniem (wyłączenie, uśpienie, restart, wylogowanie, blokada, wyłączenie monitora).
-  * Uruchamianie zewnętrznych poleceń, skryptów lub programów.
-  * Odtwarzanie własnych sygnałów dźwiękowych.
-  * Automatyczne wysyłanie wiadomości e-mail z gotowych szablonów (w tym HTML, załączniki, wyniki poleceń).
-  * Wykonywanie zrzutów ekranu, czyszczenie wskazanych katalogów/dysku oraz generowanie raportów i notatek.
-* **Harmonogram i wielozadaniowość:** Zarządzaj wieloma zadaniami jednocześnie dzięki zaawansowanej liście zadań i elastycznym opcjom powtórzeń.
-* **Bezpieczeństwo i wygoda:**
-  * Ochrona ustawień za pomocą silnie szyfrowanego hasła.
-  * Autozapis konfiguracji oraz automatyczne sprawdzanie aktualizacji przy starcie.
-  * Działanie w tle z poziomu zasobnika systemowego (tray) z odzwierciedleniem stanu liczników.
-  * Funkcja zapobiegająca niechcianemu uśpieniu systemu przez Windows.
-* **Nowoczesny interfejs:** Przejrzyste, responsywne menu boczne, pełne wsparcie dla jasnego i ciemnego motywu oraz obsługa języka polskiego i angielskiego.
-
----
-
-## ⚙️ Wymagania systemowe
-
-* **System operacyjny:** Windows 10, Windows 11 (oraz Windows 7 SP1* / Windows 8.1*).
-* **Środowisko:** .NET Framework w wersji 8.0 lub nowszej.
-* **Uprawnienia:** Konto użytkownika z uprawnieniami do uruchamiania aplikacji desktopowych.
-
-*\* Uwaga dot. starszych systemów: Windows 7 oraz 8.1 nie są już wspierane przez firmy Microsoft i zewnętrznych twórców. Program nie był szczegółowo testowany na tych wersjach – zalecamy korzystanie z aktualnego systemu Windows.*  
-*\* **Dostęp do internetu:** Wymagany wyłącznie do pobierania aktualizacji aplikacji oraz wysyłania powiadomień e-mail.*
-
----
-
-<details>
-<summary><b>English Description (Click to expand)</b></summary>
-
-# Timer
-
+#
 **Timer** is an advanced yet lightweight tool designed to automate daily tasks on Windows computers. The application allows you to execute predefined actions after a countdown, based on a schedule, or upon detecting user inactivity. Unlike basic system commands, it supports a wide variety of operations—ranging from standard power management to sending emails, capturing screenshots, cleaning disks, and executing custom scripts.
 
-## 🚀 Download
-You can download the latest installation packages and source code directly from the **[Releases](https://github.com/Mattronix7200/TimerSysApp/releases)** page.
+<img width="904" height="617" alt="image" src="https://github.com/user-attachments/assets/a18d64cf-aaa1-4e50-8fe2-39c144400346" />
 
 ## ✨ Key Features
 * **Flexible Operating Modes:** Quick countdown timers (HH:MM:SS), scheduled tasks, and inactivity detection counters.
@@ -69,9 +17,8 @@ You can download the latest installation packages and source code directly from 
 * **Runtime:** .NET Framework 8.0+.
 * **Internet:** Required only for auto-updates and email action execution.
 
-</details>
+## 🚀 Download
 
----
+Version: 1.0.7. Released: 11.10.2026.
 
-## 💬 Opinie i rozwój
-Zachęcam do testowania programu, zgłaszania uwag oraz tworzenia własnych zgłoszeń (Issues) w przypadku napotkania błędów. Gorąco zachęcam do wsparcia projektu!
+https://github.com/Mattronix7200/Timer/releases/tag/release-1.0.7
