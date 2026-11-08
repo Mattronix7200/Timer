@@ -17,6 +17,16 @@
 * **Runtime:** .NET Framework 8.0+.
 * **Internet:** Required only for auto-updates and email action execution.
 
+## License
+Free viewing, downloading, and modification of this source code is permitted exclusively for private, educational, and non-commercial purposes.
+
+Terms and Restrictions:
+
+- Selling, licensing, or using this code (or its modified versions) for commercial purposes without the author's prior written consent is strictly prohibited.
+- Publishing modified versions under a different brand/product as a proprietary commercial solution without the author's consent is strictly prohibited.
+- Any modified versions shared publicly must include a notice acknowledging the original author and must be distributed under this license.
+- The software is provided "AS IS", without any warranty of any kind.
+
 ## 🚀 Download
 
 Version: 1.0.7. Released: 11.10.2026.
